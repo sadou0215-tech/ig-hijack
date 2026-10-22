@@ -1,0 +1,21 @@
+cat > .gitignore <<'EOF'
+# --- secrets ---
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# --- python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# --- misc ---
+.DS_Store
+.idea/
+.vscode/
+*.log
+EOF

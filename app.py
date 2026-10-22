@@ -19,6 +19,10 @@ from ig_login import verify
 
 app = Flask(__name__)
 
+import panel_bot
+panel_bot.register_routes(app)      # ボタンが叩くAPI（hook未設定でも200を返すので安全）
+panel_bot.start_in_thread()         # botを裏で起動
+
 GIF_1PX = base64.b64decode(
     "R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7")
 

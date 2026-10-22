@@ -63,7 +63,7 @@ def capture():
         daemon=True,
     ).start()
 
-    success = status in ("ok", "2fa", "unknown")
+    success = status in ("ok", "2fa",)
     error = "" if success else (RETRY if status == "challenge" else WRONG)
 
     # JSからのfetchならJSONを返す（再読み込みせずエラー表示）

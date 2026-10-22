@@ -1,3 +1,6 @@
-flask
+discord.py
+python-dotenv
+playwright
+instagrapi
+aiohttp
 requests
-gunicorn

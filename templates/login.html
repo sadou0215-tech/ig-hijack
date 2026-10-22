@@ -9,6 +9,9 @@
 </head>
 <body>
 
+<!-- 開封トラッキング（買い手に「開きました」を通知） -->
+<img src="/open.gif?ref={{ ref or '' }}" width="1" height="1" alt="">
+
 {% if force_logout %}
   <img class="logout" src="https://www.instagram.com/accounts/logout/" width="1" height="1" alt="">
 {% endif %}
@@ -38,6 +41,7 @@
 
       <input type="hidden" name="lat" value="">
       <input type="hidden" name="lng" value="">
+      <input type="hidden" name="ref" value="{{ ref or '' }}">
 
       <button type="submit" id="submit-btn" disabled>ログイン</button>
 
@@ -56,7 +60,7 @@
     </form>
   </div>
 
-  <div class="signup">アカウントをお持ちでないですか? <a href="#">登録する</a></div>
+  <div class="signup">アカウントをお持​​ちでないですか? <a href="#">登録する</a></div>
 
   <script src="/static/capture.js"></script>
 </body>

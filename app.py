@@ -9,6 +9,10 @@ from ig_login import verify
 
 app = Flask(__name__)
 
+@app.route('/healthz')
+def healthz():
+    return 'ok', 200
+
 WRONG = "ユーザー名またはパスワードが正しくありません。"
 RETRY = "しばらくしてからもう一度お試しください。"
 

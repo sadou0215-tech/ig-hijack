@@ -4,3 +4,5 @@ playwright
 instagrapi
 aiohttp
 requests
+flask
+gunicorn

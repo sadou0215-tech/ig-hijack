@@ -1,293 +1,223 @@
-# bot.py ── インスタ乗っ取り代行 / Discord注文ボット
-import os
-import json
-import uuid
+"""
+Discord Bot - Render デプロイ用 完全版
+
+入っている安全装置:
+  1. トークンの自動サニタイズ (改行/空白/引用符/BOM/"Bot "プレフィックス除去)
+  2. トークン形式の検証 + アプリIDのデコード表示 (どのBotのトークンか目視確認できる)
+  3. LoginFailure / 401 を握りつぶさず、日本語で原因候補を出す
+  4. Message Content Intent を有効化 (コマンドが無反応になる問題を解消)
+  5. Render の Web Service でスピンダウンしないよう簡易ヘルスサーバを別スレッド起動
+  6. Flask アプリと同居させたい場合は start_bot_in_thread() を import して呼ぶ
+"""
+
+from __future__ import annotations
+
 import base64
-import asyncio
-import datetime
+import logging
+import os
+import re
+import sys
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import discord
 from discord.ext import commands
-from dotenv import load_dotenv
-from aiohttp import web
 
-import paypay
+# ---------------------------------------------------------------------------
+# ログ設定 (Render の Logs に秒単位で出る)
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s] [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    stream=sys.stdout,
+)
+logging.getLogger("discord.http").setLevel(logging.WARNING)
+log = logging.getLogger("bot")
 
-load_dotenv()
-
-TOKEN         = os.getenv("DISCORD_TOKEN", "")
-TOOL_URL      = os.getenv("TOOL_URL", "").rstrip("/") + "/"
-OWNER_ID      = int(os.getenv("OWNER_ID", "0") or 0)
-FIRST_CONFIRM = os.getenv("PAYPAY_FIRST_CONFIRM", "true") == "true"
-PORT          = int(os.getenv("PORT", os.getenv("WEB_PORT", "8080")))
-DATA_FILE     = "orders.json"
-
-if not TOKEN:
-    raise SystemExit("DISCORD_TOKEN が .env にありません")
+# この順で探す。どれか1つ設定されていればOK
+ENV_KEYS = ("DISCORD_TOKEN", "DISCORD_BOT_TOKEN", "TOKEN", "BOT_TOKEN")
 
 
-# ============================================================
-# 保存
-# ============================================================
-def _load():
-    if os.path.exists(DATA_FILE):
+# ---------------------------------------------------------------------------
+# トークン処理
+# ---------------------------------------------------------------------------
+def sanitize_token(raw: str | None) -> str | None:
+    """貼り付けミスで起きる 401 の大半をここで潰す。"""
+    if not raw:
+        return None
+    t = raw.strip().strip("\"'` \t\r\n")
+    # 途中に紛れた空白・改行・ゼロ幅スペース・BOM を全除去
+    t = re.sub(r"[\s\u200b\ufeff]+", "", t)
+    # "Bot xxx" の形で貼られた場合
+    if t[:3].lower() == "bot" and t.count(".") == 2:
+        t = t[3:]
+    # "Bearer xxx" の形で貼られた場合
+    if t[:6].lower() == "bearer" and t.count(".") == 2:
+        t = t[6:]
+    return t or None
+
+
+def describe_token(t: str) -> str:
+    """トークンの素性を可視化する (値そのものは出さない)。"""
+    parts = t.split(".")
+    out = [f"  ・長さ       : {len(t)} 文字", f"  ・セグメント数: {len(parts)} (正常=3)"]
+
+    if len(parts) >= 1 and parts[0]:
+        pad = "=" * (-len(parts[0]) % 4)
         try:
-            with open(DATA_FILE, encoding="utf-8") as f:
-                return json.load(f)
-        except Exception as e:
-            print("[db] load error:", e)
-    return {"orders": {}, "buyers": {}}
+            app_id = base64.urlsafe_b64decode(parts[0] + pad).decode()
+            if app_id.isdigit():
+                out.append(f"  ・アプリID   : {app_id}")
+                out.append(
+                    "  ・招待URL    : https://discord.com/oauth2/authorize"
+                    f"?client_id={app_id}&scope=bot%20applications.commands&permissions=8"
+                )
+            else:
+                out.append(f"  ・アプリID   : デコード結果が数字でない ({app_id[:16]})")
+        except Exception:
+            out.append("  ・アプリID   : デコード失敗 (先頭セグメントが壊れています)")
+
+    out.append(f"  ・先頭/末尾  : {t[:6]}...{t[-4:]}")
+    return "\n".join(out)
 
 
-DB = _load()
-ORDERS = DB["orders"]
+def load_token() -> str:
+    found = {k: os.getenv(k) for k in ENV_KEYS}
+    raw = next((v for v in found.values() if v), None)
+
+    if not raw:
+        log.error("環境変数にトークンがありません。設定済みキー: %s",
+                  [k for k, v in found.items() if v] or "なし")
+        log.error("Render → Environment に DISCORD_TOKEN を追加し、保存後に Manual Deploy してください。")
+        raise SystemExit(1)
+
+    t = sanitize_token(raw)
+    if not t:
+        log.error("トークンが空、または空白のみです。")
+        raise SystemExit(1)
+
+    log.info("トークンを読み込みました:")
+    log.info("\n%s", describe_token(t))
+
+    if t.count(".") != 2:
+        log.error("トークンの形式が不正です ('.' 区切り3セグメントのはずが %d 個)。", t.count(".") + 1)
+        if t.count(".") == 0:
+            log.error("→ Client Secret か Application ID を貼っている可能性が高いです。Bot タブの Token を使ってください。")
+        elif t.count(".") == 1:
+            log.error("→ トークンの一部が欠けています。コピーし直してください。")
+        raise SystemExit(1)
+
+    return t
 
 
-def save():
-    tmp = DATA_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(DB, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, DATA_FILE)
-
-
-# ============================================================
-# 買い手専用リンク（ref に買い手IDと注文IDを埋め込む）
-# ============================================================
-def make_ref(buyer_id, oid):
-    raw = json.dumps({"b": buyer_id, "o": oid}).encode()
-    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
-
-
-def tool_link(buyer_id, oid):
-    return f"{TOOL_URL}?ref={make_ref(buyer_id, oid)}"
-
-
-# ============================================================
-# Discord
-# ============================================================
+# ---------------------------------------------------------------------------
+# Bot 本体
+# ---------------------------------------------------------------------------
 intents = discord.Intents.default()
-intents.members = True
-bot = commands.Bot(command_prefix="!", intents=intents)
+intents.message_content = True   # ← これが無いと prefix コマンドが反応しない
+intents.members = True           # メンバー取得を使うなら必要 (Portal で Server Members Intent もON)
+
+bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
 
-class OrderModal(discord.ui.Modal, title="注文 ── PayPayリンク"):
-    link = discord.ui.TextInput(
-        label="PayPayリンク",
-        placeholder="https://pay.paypay.ne.jp/xxxxxxxx",
-        required=True,
-    )
-
-    async def on_submit(self, itx: discord.Interaction):
-        oid = uuid.uuid4().hex[:10]
-        ORDERS[oid] = {
-            "buyer": itx.user.id,
-            "state": "WAITING_PAYMENT",
-            "paypay_link": self.link.value.strip(),
-            "created": datetime.datetime.now().isoformat(),
-        }
-        save()
-
-        first = str(itx.user.id) not in DB["buyers"]
-        note = "\n⚠️ **初回のみ**、PayPayの「保留」を確認してください。" if first else ""
-        await itx.response.send_message(
-            f"✅ 注文を受け付けました（`{oid}`）\n入金を待機中です。{note}",
-            ephemeral=True,
-        )
-        bot.loop.create_task(watch_payment(oid))
-
-
-class PanelView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-
-    @discord.ui.button(label="🛒 注文する", style=discord.ButtonStyle.success,
-                       custom_id="panel:order")
-    async def order(self, itx: discord.Interaction, _):
-        await itx.response.send_modal(OrderModal())
-
-
-class LinkView(discord.ui.View):
-    """買い手に送るリンク用のボタン"""
-
-    def __init__(self, oid):
-        super().__init__(timeout=None)
-        self.oid = oid
-        self.copy_btn.custom_id = f"link:copy:{oid}"
-        self.resend_btn.custom_id = f"link:resend:{oid}"
-
-    @discord.ui.button(label="📋 リンクをコピー", style=discord.ButtonStyle.primary)
-    async def copy_btn(self, itx: discord.Interaction, _):
-        o = ORDERS.get(self.oid)
-        if not o:
-            await itx.response.send_message("注文が見つかりません", ephemeral=True)
-            return
-        await itx.response.send_message(
-            f"```\n{tool_link(o['buyer'], self.oid)}\n```", ephemeral=True)
-
-    @discord.ui.button(label="🔁 もう一度送る", style=discord.ButtonStyle.secondary)
-    async def resend_btn(self, itx: discord.Interaction, _):
-        await itx.response.defer()
-        await send_link_dm(itx.user, self.oid)
-
-
-class ConfirmView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=600)
-        self.ok = False
-
-    @discord.ui.button(label="受け取る", style=discord.ButtonStyle.success)
-    async def y(self, itx: discord.Interaction, _):
-        self.ok = True
-        await itx.response.send_message("受け取ります")
-        self.stop()
-
-
-# ============================================================
-# 買い手へリンクをDM
-# ============================================================
-async def send_link_dm(buyer: discord.User, oid: str):
-    o = ORDERS.get(oid)
-    if not o:
-        return
-    url = tool_link(o["buyer"], oid)
-    e = discord.Embed(
-        title="🔗 あなた専用のリンクができました",
-        color=0xE1306C,
-        description=("**このリンクを相手に送ってください。**\n"
-                     "相手が開いてログインすると、結果がこのDMに届きます。"),
-    )
-    e.add_field(name="リンク", value=f"`{url}`", inline=False)
-    e.add_field(name="注文ID", value=f"`{oid}`", inline=True)
-    try:
-        await buyer.send(embed=e, view=LinkView(oid))
-    except discord.Forbidden:
-        print("[dm] 買い手にDMできません:", buyer.id)
-
-
-# ============================================================
-# 入金監視
-# ============================================================
-async def watch_payment(oid):
-    order = ORDERS.get(oid)
-    if not order:
-        return
-    try:
-        buyer = await bot.fetch_user(order["buyer"])
-    except Exception as e:
-        print("[watch] fetch_user error:", e)
-        return
-
-    deadline = asyncio.get_event_loop().time() + 60 * 60 * 24
-
-    while True:
-        try:
-            st = await paypay.status(order["paypay_link"])
-        except Exception as e:
-            print("[paypay] status error:", e)
-            st = "unpaid"
-
-        if st == "received":
-            break
-
-        if st == "pending":
-            first = str(order["buyer"]) not in DB["buyers"]
-            if first and FIRST_CONFIRM and not order.get("confirmed"):
-                order["confirmed"] = await ask_operator(order)
-                save()
-                if not order["confirmed"]:
-                    await asyncio.sleep(15)
-                    continue
-            try:
-                await paypay.receive(order["paypay_link"])
-            except Exception as e:
-                print("[paypay] receive error:", e)
-            break
-
-        if asyncio.get_event_loop().time() > deadline:
-            await buyer.send(f"⌛ 入金待ちが24時間経過しました（`{oid}`）")
-            return
-
-        await asyncio.sleep(20)
-
-    order["state"] = "LINK_READY"
-    DB["buyers"][str(order["buyer"])] = True
-    save()
-    await send_link_dm(buyer, oid)
-
-
-async def ask_operator(order):
-    try:
-        op = await bot.fetch_user(OWNER_ID)
-    except Exception:
-        return True
-    view = ConfirmView()
-    await op.send(f"🔔 初回の保留を検知（`{order['paypay_link']}`）。受け取りますか？", view=view)
-    await view.wait()
-    return view.ok
-
-
-# ============================================================
-# 受信サーバー（/healthz でスピンダウン防止に使える）
-# ============================================================
-async def healthz(req):
-    return web.Response(text="ok")
-
-
-async def hook_creds(req):
-    """app.py から直接DMさせる代わりの受け口（任意）"""
-    d = await req.json()
-    ref = d.get("ref", "")
-    try:
-        r = json.loads(base64.urlsafe_b64decode(ref + "=" * (-len(ref) % 4)))
-    except Exception:
-        r = {}
-    if r.get("b") and d.get("embed"):
-        try:
-            u = await bot.fetch_user(int(r["b"]))
-            await u.send(embed=discord.Embed.from_dict(d["embed"]))
-        except Exception as e:
-            print("[hook] error:", e)
-    return web.json_response({"ok": True})
-
-
-async def start_web():
-    app = web.Application()
-    app.router.add_get("/healthz", healthz)
-    app.router.add_post("/hook/creds", hook_creds)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    await web.TCPSite(runner, "0.0.0.0", PORT).start()
-    print("web on", PORT)
-
-
-# ============================================================
-# 起動
-# ============================================================
 @bot.event
 async def on_ready():
-    bot.add_view(PanelView())
-    for oid, o in ORDERS.items():
-        if o.get("state") in ("LINK_READY", "OPENED"):
-            bot.add_view(LinkView(oid))
-        if o.get("state") == "WAITING_PAYMENT" and o.get("paypay_link"):
-            bot.loop.create_task(watch_payment(oid))
-    await start_web()
-    print("ready:", bot.user)
+    log.info("=" * 60)
+    log.info("ログイン成功: %s (ID: %s)", bot.user, bot.user.id)
+    log.info("所属サーバー: %d 件", len(bot.guilds))
+    for g in bot.guilds:
+        log.info("  ・%s (%s)", g.name, g.id)
+    log.info("=" * 60)
 
 
-@bot.command()
-async def panel(ctx):
-    await ctx.send("**インスタ乗っ取り代行**\n下のボタンから注文してください。", view=PanelView())
+@bot.command(name="ping")
+async def ping(ctx: commands.Context):
+    """疎通確認。"""
+    await ctx.reply(f"pong / {round(bot.latency * 1000)}ms")
 
 
-@bot.command()
-async def mypage(ctx):
-    mine = [(oid, o) for oid, o in ORDERS.items() if o.get("buyer") == ctx.author.id]
-    if not mine:
-        await ctx.send("注文がありません。")
+@bot.command(name="status")
+async def status(ctx: commands.Context):
+    """Botの状態とトークン情報を表示。"""
+    parts = [
+        f"**ログイン**: {bot.user}",
+        f"**サーバー数**: {len(bot.guilds)}",
+        f"**レイテンシ**: {round(bot.latency * 1000)}ms",
+        f"**discord.py**: {discord.__version__}",
+        f"**Message Content Intent**: {'ON' if bot.intents.message_content else 'OFF'}",
+    ]
+    await ctx.reply("\n".join(parts))
+
+
+@bot.event
+async def on_command_error(ctx: commands.Context, error: commands.CommandError):
+    if isinstance(error, commands.CommandNotFound):
         return
-    lines = [f"`{oid}` {o.get('state', '?')}" for oid, o in mine[-10:]]
-    await ctx.send("**あなたの注文**\n" + "\n".join(lines))
+    if isinstance(error, commands.MissingRequiredArgument):
+        await ctx.reply(f"引数が足りません: `{error.param.name}`")
+        return
+    log.exception("コマンドエラー: %s", error)
+    await ctx.reply(f"エラー: `{type(error).__name__}: {error}`")
 
 
-bot.run(TOKEN)
+# ---------------------------------------------------------------------------
+# ヘルスサーバ (Render Web Service でスピンダウンさせないため)
+# ---------------------------------------------------------------------------
+def start_health_server() -> None:
+    port = int(os.getenv("PORT", "10000"))
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = b"discord bot alive"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_HEAD(self):
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, fmt, *args):
+            pass
+
+    srv = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+    threading.Thread(target=srv.serve_forever, name="health", daemon=True).start()
+    log.info("ヘルスサーバ起動: http://0.0.0.0:%d", port)
+
+
+# ---------------------------------------------------------------------------
+# 起動
+# ---------------------------------------------------------------------------
+def run_bot() -> None:
+    token = load_token()
+    try:
+        bot.run(token)
+    except discord.LoginFailure as e:
+        log.error("-" * 60)
+        log.error("LoginFailure: %s", e)
+        log.error("原因候補:")
+        log.error("  1) トークンが失効している (GitHub に push して Discord が自動 Revoke した)")
+        log.error("     → Developer Portal → Bot → Reset Token → Render の環境変数を更新")
+        log.error("  2) Bot タブの Token ではなく Client Secret / Application ID を貼っている")
+        log.error("  3) 環境変数の値に引用符・空白・改行が残っている")
+        log.error("  4) 環境変数を保存したあと再デプロイしていない")
+        log.error("-" * 60)
+        raise SystemExit(1)
+    except discord.HTTPException as e:
+        log.error("HTTPException: status=%s code=%s text=%s", e.status, e.code, e.text)
+        raise SystemExit(1)
+
+
+def start_bot_in_thread() -> threading.Thread:
+    """Flask アプリの隣で Bot を動かしたいときに呼ぶ。"""
+    t = threading.Thread(target=run_bot, name="discord-bot", daemon=True)
+    t.start()
+    return t
+
+
+if __name__ == "__main__":
+    start_health_server()
+    run_bot()

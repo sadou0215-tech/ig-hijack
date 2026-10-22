@@ -1,8 +1,4 @@
-discord.py
-python-dotenv
-playwright
-instagrapi
-aiohttp
-requests
 flask
+requests
+discord.py>=2.4.0
 gunicorn

@@ -1,5 +1,5 @@
-flask
-requests
-discord.py>=2.4.0
-gunicorn
+Flask==3.0.3
 discord.py==2.4.0
+gunicorn==22.0.0
+requests==2.32.3
+python-dotenv==1.0.1

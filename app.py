@@ -59,6 +59,7 @@ TZ_OFFSET = int(os.getenv("TZ_OFFSET", "9"))
 WEBHOOK_URL = (os.getenv("DISCORD_WEBHOOK_URL") or os.getenv("DISCORD_WEBHOOK")
                or os.getenv("WEBHOOK_URL") or "").strip()
 BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN") or os.getenv("BOT_TOKEN") or ""
+　　　　　　　　or os.getenv("BOT_TOKEN") or "").strip()
 GUILD_ID = os.getenv("GUILD_ID")
 PANEL_CHANNEL_ID = os.getenv("PANEL_CHANNEL_ID")
 PANEL_COMMAND = os.getenv("PANEL_COMMAND", "panel")

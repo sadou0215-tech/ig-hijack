@@ -2,3 +2,4 @@ flask
 requests
 discord.py>=2.4.0
 gunicorn
+discord.py==2.4.0

